@@ -34,7 +34,6 @@ from client.ui.sidebar import (
     button_color,
     buttons_y,
     clamp,
-    compute_tuning_tip,
     draw_slider_row,
     fit_hint,
     handle_slider_hit,
@@ -232,8 +231,6 @@ def tick_frame() -> bool:
     text_w = w - SIDEBAR_W - 36
     cap_top = 12 + TIP_H
     cap_bottom = h - FOOTER_H
-    tip_surf = theme.hint_font.render(fit_hint(compute_tuning_tip(), text_w), True, (150, 175, 210))
-    theme.screen.blit(tip_surf, (18, 14))
     rebuild_captions(text_w)
     caption_height = get_caption_height()
     if auto_scroll:

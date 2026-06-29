@@ -48,58 +48,6 @@ def fit_hint(text, max_w):
         trimmed = trimmed[:-1]
     return trimmed + "…"
 
-def compute_tuning_tip() -> str:
-    tel = state["telemetry"]
-    now = time.monotonic()
-    stale = now - state.get("last_caption_mono", 0.0)
-    capturing = tel.get("display_capture", 0.0) > 0.45
-    noise = tel.get("noise_score", 0.0)
-    input_rms = tel.get("input_rms", 0.0)
-    speech_prob = tel.get("speech_prob", 0.0)
-    sliders = state["slider_values"]
-
-    if state["singing_mode"]:
-        if stale > 5.0 and capturing:
-            return "Singing: Volume floor ← or Word accuracy ← for faster live text"
-        if stale > 3.0:
-            return "Singing: partials at low rate — Word accuracy ← speeds them up"
-        return "Singing: Volume floor ← for soft vocals; Uncertain words → to reduce junk"
-
-    if stale > 5.0 and capturing:
-        if sliders.get("final_beam", 3) >= 4:
-            return "Captions stalled? Word accuracy ← for speed, or Max line length ←"
-        return "Captions stalled? Quiet speech → or Volume floor ←"
-
-    if input_rms > 0.02 and speech_prob < 0.25 and not capturing:
-        return "Speech not picked up? Quiet speech → (or check mic level)"
-
-    if noise > 0.55 and capturing:
-        return "Noisy room — Quiet speech ← to ignore background, or SFX profile: noisy"
-
-    if noise > 0.35 and sliders.get("vad_sensitivity_boost", 0) < 0.03:
-        return "Background bleed? Quiet speech ← slightly"
-
-    if (
-        state.get("sound_labels")
-        and pygame.time.get_ticks() - state.get("sound_timestamp", 0) > 12000
-        and sliders.get("yamnet_base_threshold", 0.52) > 0.48
-    ):
-        return "Missing SFX? SFX profile: media · Music/choir ← · SFX denoise ←"
-
-    if sliders.get("phrase_timeout_sec", 0.75) < 0.6:
-        return "Lines split mid-thought? Pause ends line → for longer pauses"
-
-    if sliders.get("max_utterance_sec", 6.0) <= 4.0:
-        return "Lines cut off? Max line length → for longer phrases"
-
-    if stale > 2.5 and capturing and sliders.get("final_beam", 3) >= 4:
-        return "Feels slow? Word accuracy ← for faster partials and finals"
-
-    if speech_prob > 0.5 and capturing:
-        return "Live tuning OK — drag sliders; hints show under each control"
-
-    return "Adjust sliders as the room changes — tips update from mic telemetry"
-
 def btn_label(name):
     if name == "caption_translate":
         return "Mode: Translate" if state["translate_mode"] else "Mode: Captions"
