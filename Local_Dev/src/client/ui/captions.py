@@ -1,3 +1,4 @@
+from client import theme
 from client.state import (
     _caption_height,
     _caption_lines,
@@ -9,7 +10,7 @@ from client.state import (
     _partial_lines,
     state,
 )
-from client.theme import SPEAKER_COLORS, font
+from client.theme import SPEAKER_COLORS
 from client.tuning_specs import LINE_H
 
 def wrap_text(text, font_obj, max_width):
@@ -49,7 +50,7 @@ def _render_caption_items(items, text_w, *, mark_partial: bool = False):
         if not state.get("show_speakers", True):
             speaker = "SPEAKER_00"
         color = SPEAKER_COLORS.get(speaker, (240, 240, 240))
-        for i, row in enumerate(wrap_text(body, font, text_w)):
+        for i, row in enumerate(wrap_text(body, theme.font, text_w)):
             if (
                 state.get("show_speakers", True)
                 and state["display_mode"] == "label"
@@ -57,7 +58,7 @@ def _render_caption_items(items, text_w, *, mark_partial: bool = False):
                 and speaker != last_spk
             ):
                 row = f"[{_speaker_label(speaker)}] {row}"
-            surf = font.render(row, True, color)
+            surf = theme.font.render(row, True, color)
             if mark_partial:
                 surf.set_alpha(190)
             lines.append((surf, y))
