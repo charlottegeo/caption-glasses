@@ -17,20 +17,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libc-dev \
     linux-headers-amd64 \
     libsndfile1-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
 COPY src/requirements.txt .
 
-# Run that back!
+ENV UV_NATIVE_TLS=1
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121
+
 RUN --mount=type=cache,target=/root/.cache/uv \ 
-    uv pip install --system \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121 && \
     uv pip install --system -r requirements.txt
 
 COPY src/ .
 COPY --from=docbuilder /docs/site /src/docs
     
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "2001","--log-config", "/src/logging_config.yaml"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080","--log-config", "/src/logging_config.yaml"]
