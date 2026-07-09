@@ -529,7 +529,7 @@ async def process_speaking(websocket: WebSocketData, audio_chunk: np.ndarray) ->
             audio = _slice_voiced_audio(websocket)
             if audio is not None:
                 websocket.last_partial_monotonic = now
-                await _schedule_transcription(
+                await _schedule_partial_transcription(
                     websocket,
                     audio,
                     _current_speaker(websocket.settings),
