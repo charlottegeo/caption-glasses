@@ -2,9 +2,11 @@
 
 services:
   cg_server_run:
-    build: 
+    build:
       context: .
       dockerfile: Containerfile
+      args:
+        BUILD_DOCS: ${BUILD_DOCS:-true}
     container_name: CaptionGlassesServer
     ports:
       - "8080:8080"
@@ -16,4 +18,3 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
     devices:
       - nvidia.com/gpu=${GPU_DEVICE:-0}
-#UNCOMMENT THESE ONLY DURING LOCAL DEV
