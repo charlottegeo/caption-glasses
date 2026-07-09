@@ -2,8 +2,8 @@ import math
 import time
 import pygame
 
+from client import theme
 from client.state import _btn_last_click, state
-from client.theme import hint_font, ui_font
 from client.tuning_specs import (
     ALL_SLIDER_SPECS,
     BTN_DEBOUNCE_SEC,
@@ -39,6 +39,14 @@ def fmt_val(spec, value):
     if spec["fmt"] == "d":
         return f"{int(round(value))}{sfx}"
     return f"{value:{spec['fmt']}}{sfx}"
+
+def fit_hint(text, max_w):
+    if theme.hint_font.size(text)[0] <= max_w:
+        return text
+    trimmed = text
+    while trimmed and theme.hint_font.size(trimmed + "…")[0] > max_w:
+        trimmed = trimmed[:-1]
+    return trimmed + "…"
 
 def btn_label(name):
     if name == "caption_translate":
@@ -88,16 +96,16 @@ def draw_slider_row(screen, spec, row_y, track_w, x, active, colors):
     val = state["slider_values"][spec["key"]]
     ratio = slider_ratio(spec, val)
     val_txt = fmt_val(spec, val)
-    val_surf = hint_font.render(val_txt, True, (160, 200, 160))
+    val_surf = theme.hint_font.render(val_txt, True, (160, 200, 160))
     label_max = track_w - val_surf.get_width() - 6
     label_txt = spec["label"]
-    if ui_font.size(label_txt)[0] > label_max:
-        while label_txt and ui_font.size(label_txt + "…")[0] > label_max:
+    if theme.ui_font.size(label_txt)[0] > label_max:
+        while label_txt and theme.ui_font.size(label_txt + "…")[0] > label_max:
             label_txt = label_txt[:-1]
         label_txt += "…"
-    screen.blit(ui_font.render(label_txt, True, (225, 225, 225)), (x, row_y))
+    screen.blit(theme.ui_font.render(label_txt, True, (225, 225, 225)), (x, row_y))
     screen.blit(val_surf, (x + track_w - val_surf.get_width(), row_y))
-    screen.blit(hint_font.render(fit_hint(spec["hint"], track_w), True, (115, 115, 115)), (x, row_y + 17))
+    screen.blit(theme.hint_font.render(fit_hint(spec["hint"], track_w), True, (115, 115, 115)), (x, row_y + 17))
     track = pygame.Rect(x, row_y + 36, track_w, 8)
     pygame.draw.rect(screen, (50, 50, 50), track, border_radius=3)
     fill = max(2, int(track_w * ratio))

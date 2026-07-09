@@ -1,7 +1,8 @@
 import pygame
 
+from client import theme
 from client.state import _meter_cache, state
-from client.theme import ENV_COLORS, hint_font
+from client.theme import ENV_COLORS
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -48,9 +49,9 @@ def draw_noise_meter(screen, x, y):
     pygame.draw.circle(screen, inner_color, (x, y), inner_r)
     pygame.draw.circle(screen, (235, 235, 235), (x, y), inner_r, 1)
     status = "Capturing" if tel["display_capture"] > 0.5 else "Listening"
-    screen.blit(hint_font.render(status, True, inner_color), (x + inner_r + 10, y - 8))
+    screen.blit(theme.hint_font.render(status, True, inner_color), (x + inner_r + 10, y - 8))
     screen.blit(
-        hint_font.render(
+        theme.hint_font.render(
             f"in {tel['display_input'] * 100:.0f}%  vad {tel.get('speech_prob', 0):.2f}",
             True,
             (150, 150, 150),

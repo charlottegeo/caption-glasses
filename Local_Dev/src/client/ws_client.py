@@ -19,6 +19,25 @@ ws_send_queue: asyncio.Queue | None = None
 ws_audio_queue: asyncio.Queue | None = None
 ws_cmd_outbound_queue: asyncio.Queue | None = None
 _audio_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="caption-audio")
+_mic = {"p": None, "stream": None}
+
+def _open_mic():
+    p = pyaudio.PyAudio()
+    stream = p.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=DEVICE_CAPTURE_RATE,
+        input=True,
+        frames_per_buffer=4096,
+    )
+    return p, stream
+
+def _read_mic_chunk(downsample: int) -> bytes:
+    stream = _mic["stream"]
+    data = stream.read(4096, exception_on_overflow=False)
+    audio = np.frombuffer(data, dtype=np.float32)
+    resampled = resample_poly(audio, 160, downsample).astype(np.float32)
+    return resampled.tobytes()
 
 def init_queues() -> None:
     global ws_send_queue, ws_audio_queue, ws_cmd_outbound_queue
@@ -63,7 +82,10 @@ async def ws_outbound(websocket):
                     await task
                 except asyncio.CancelledError:
                     pass
-        await websocket.send(payload)
+        try:
+            await websocket.send(payload)
+        except websockets.ConnectionClosed:
+            break
 
 async def ws_sender(websocket):
     while True:
@@ -81,30 +103,26 @@ async def ws_sender(websocket):
                 pass
 
 async def send_audio(websocket):
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=DEVICE_CAPTURE_RATE,
-        input=True,
-        frames_per_buffer=4096,
-    )
     loop = asyncio.get_running_loop()
     downsample = int(DEVICE_CAPTURE_RATE / 100)
-
-    def read_chunk() -> bytes:
-        data = stream.read(4096, exception_on_overflow=False)
-        audio = np.frombuffer(data, dtype=np.float32)
-        resampled = resample_poly(audio, 160, downsample).astype(np.float32)
-        return resampled.tobytes()
-
     try:
+        p, stream = await loop.run_in_executor(_audio_executor, _open_mic)
+        _mic["p"] = p
+        _mic["stream"] = stream
         while True:
-            payload = await loop.run_in_executor(_audio_executor, read_chunk)
+            payload = await loop.run_in_executor(
+                _audio_executor, _read_mic_chunk, downsample
+            )
             await ws_audio_queue.put(payload)
     finally:
-        stream.close()
-        p.terminate()
+        stream = _mic["stream"]
+        p = _mic["p"]
+        _mic["stream"] = None
+        _mic["p"] = None
+        if stream is not None:
+            stream.close()
+        if p is not None:
+            p.terminate()
 
 async def receive_text(websocket):
     while True:
