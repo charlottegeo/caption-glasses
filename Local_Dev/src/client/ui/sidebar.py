@@ -3,6 +3,11 @@ import time
 import pygame
 
 from client import theme
+from client.sfx_categories import (
+    SFX_CATEGORY_DEFS,
+    category_icon_char,
+    normalize_sfx_category,
+)
 from client.state import _btn_last_click, state
 from client.tuning_specs import (
     ALL_SLIDER_SPECS,
@@ -10,11 +15,13 @@ from client.tuning_specs import (
     BTN_GAP,
     BTN_H,
     HEADER_H,
-    MEDIA_SFX_DEFAULTS,
     SIDEBAR_PAD,
     SIDEBAR_W,
     SLIDER_H,
     SLIDER_SPECS,
+    SFX_CAT_COLS,
+    SFX_CAT_GAP,
+    SFX_CAT_ROW_H,
     SFX_SLIDER_SPECS,
     YAMNET_PROFILES,
 )
@@ -73,8 +80,17 @@ def sfx_section_y():
 def sfx_slider_y(i):
     return sfx_section_y() + i * SLIDER_H
 
+def sfx_filter_section_y():
+    return sfx_section_y() + len(SFX_SLIDER_SPECS) * SLIDER_H + 14
+
+def sfx_filter_rows() -> int:
+    return (len(SFX_CATEGORY_DEFS) + SFX_CAT_COLS - 1) // SFX_CAT_COLS
+
+def sfx_filter_height() -> int:
+    return 18 + sfx_filter_rows() * (SFX_CAT_ROW_H + SFX_CAT_GAP)
+
 def buttons_y():
-    return sfx_section_y() + len(SFX_SLIDER_SPECS) * SLIDER_H + 8
+    return sfx_filter_section_y() + sfx_filter_height() + 8
 
 def sidebar_height():
     return buttons_y() + 8 * (BTN_H + BTN_GAP) + 8
@@ -105,8 +121,7 @@ def draw_slider_row(screen, spec, row_y, track_w, x, active, colors):
         label_txt += "…"
     screen.blit(theme.ui_font.render(label_txt, True, (225, 225, 225)), (x, row_y))
     screen.blit(val_surf, (x + track_w - val_surf.get_width(), row_y))
-    screen.blit(theme.hint_font.render(fit_hint(spec["hint"], track_w), True, (115, 115, 115)), (x, row_y + 17))
-    track = pygame.Rect(x, row_y + 36, track_w, 8)
+    track = pygame.Rect(x, row_y + 22, track_w, 8)
     pygame.draw.rect(screen, (50, 50, 50), track, border_radius=3)
     fill = max(2, int(track_w * ratio))
     idle, hot = colors
@@ -119,7 +134,7 @@ def draw_slider_row(screen, spec, row_y, track_w, x, active, colors):
     pygame.draw.circle(screen, (235, 235, 235), (track.x + fill, track.centery), 5)
 
 def slider_track_rect(sb_x, row_y, scroll, track_w):
-    return pygame.Rect(sb_x + SIDEBAR_PAD, row_y - scroll + 36, track_w, 8)
+    return pygame.Rect(sb_x + SIDEBAR_PAD, row_y - scroll + 22, track_w, 8)
 
 def handle_slider_hit(event_pos, sb_x, scroll, track_w):
     for i, spec in enumerate(SLIDER_SPECS):
@@ -145,6 +160,68 @@ def slider_track_for_key(key, sb_x, scroll, track_w):
         return slider_track_rect(sb_x, slider_y(i), scroll, track_w), spec
     i = SFX_SLIDER_SPECS.index(spec)
     return slider_track_rect(sb_x, sfx_slider_y(i), scroll, track_w), spec
+
+def sfx_category_cell_rect(sb_x, scroll, track_w, index: int) -> pygame.Rect:
+    row = index // SFX_CAT_COLS
+    col = index % SFX_CAT_COLS
+    cell_w = (track_w - SFX_CAT_GAP) // SFX_CAT_COLS
+    x = sb_x + SIDEBAR_PAD + col * (cell_w + SFX_CAT_GAP)
+    y = sfx_filter_section_y() + 18 + row * (SFX_CAT_ROW_H + SFX_CAT_GAP) - scroll
+    return pygame.Rect(x, y, cell_w, SFX_CAT_ROW_H)
+
+def draw_sfx_category_filters(screen, sb_x, scroll, track_w, mouse) -> None:
+    hdr_y = sfx_filter_section_y() - scroll
+    if HEADER_H < hdr_y + 14 < screen.get_height():
+        screen.blit(
+            theme.ui_font.render("SFX categories", True, (130, 130, 130)),
+            (sb_x + SIDEBAR_PAD, hdr_y),
+        )
+    enabled = state.get("sfx_enabled_categories") or {}
+    for i, cat in enumerate(SFX_CATEGORY_DEFS):
+        rect = sfx_category_cell_rect(sb_x, scroll, track_w, i)
+        if rect.bottom < 0 or rect.top > screen.get_height():
+            continue
+        on = enabled.get(cat["id"], True)
+        style = theme.SFX_CATEGORY_STYLES.get(cat["id"], theme.SFX_DEFAULT_STYLE)
+        if on:
+            bg = style["bg"]
+            fg = style["fg"]
+        else:
+            bg = (48, 48, 52)
+            fg = (120, 120, 120)
+        if rect.collidepoint(mouse):
+            bg = tuple(min(255, c + 18) for c in bg)
+        pygame.draw.rect(screen, bg, rect, border_radius=4)
+        icon = category_icon_char(cat["id"])
+        icon_surf = theme.sfx_font.render(icon, True, fg)
+        label = fit_hint(cat["label"], rect.width - icon_surf.get_width() - 14)
+        text_surf = theme.hint_font.render(label, True, fg)
+        screen.blit(
+            icon_surf,
+            (rect.x + 6, rect.centery - icon_surf.get_height() // 2),
+        )
+        screen.blit(
+            text_surf,
+            (
+                rect.x + 10 + icon_surf.get_width(),
+                rect.centery - text_surf.get_height() // 2,
+            ),
+        )
+
+def handle_sfx_category_hit(event_pos, sb_x, scroll, track_w) -> str | None:
+    enabled = state.get("sfx_enabled_categories")
+    if not isinstance(enabled, dict):
+        return None
+    for i, cat in enumerate(SFX_CATEGORY_DEFS):
+        rect = sfx_category_cell_rect(sb_x, scroll, track_w, i)
+        if not rect.collidepoint(event_pos):
+            continue
+        if not btn_ready(f"sfx_cat_{cat['id']}"):
+            return None
+        cid = normalize_sfx_category(cat["id"])
+        enabled[cid] = not enabled.get(cid, True)
+        return cid
+    return None
 
 def button_color(name, on, hovered):
     if on and name == "caption_translate":

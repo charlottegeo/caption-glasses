@@ -1,4 +1,5 @@
 import pygame
+from client.sfx_categories import fa_solid_font_path
 
 WIDTH, HEIGHT = 1100, 620
 
@@ -25,9 +26,11 @@ SFX_CATEGORY_STYLES = {
     "domestic": {"bg": (98, 72, 38), "fg": (255, 225, 170)},
     "tools": {"bg": (70, 70, 78), "fg": (220, 220, 230)},
     "explosive": {"bg": (120, 48, 38), "fg": (255, 190, 170)},
+    "tones": {"bg": (88, 58, 48), "fg": (255, 210, 180)},
+    "ambient": {"bg": (58, 58, 68), "fg": (210, 210, 220)},
     "misc": {"bg": (58, 58, 68), "fg": (210, 210, 220)},
 }
-SFX_DEFAULT_STYLE = SFX_CATEGORY_STYLES["misc"]
+SFX_DEFAULT_STYLE = SFX_CATEGORY_STYLES["ambient"]
 
 screen: pygame.Surface
 font: pygame.font.Font
@@ -45,7 +48,11 @@ def init_pygame() -> None:
     small_font = pygame.font.SysFont("arial", 18)
     ui_font = pygame.font.SysFont("arial", 15)
     hint_font = pygame.font.SysFont("arial", 13)
-    sfx_font = pygame.font.SysFont("arial", 22, bold=True)
+    fa_path = fa_solid_font_path()
+    if fa_path.is_file():
+        sfx_font = pygame.font.Font(str(fa_path), 18)
+    else:
+        sfx_font = pygame.font.SysFont("arial", 18, bold=True)
 
 def resize_window(w: int, h: int) -> None:
     global WIDTH, HEIGHT, screen

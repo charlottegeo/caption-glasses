@@ -5,7 +5,6 @@ import gc
 import json
 import time
 import uuid
-
 import noisereduce as nr
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -16,14 +15,17 @@ from starlette.websockets import WebSocketDisconnect
 from config import (
     CAPTION_ENV_TELEMETRY,
     CHUNK_SIZE,
-    LYRICS_PARTIAL_EVERY_N_CHUNKS,
-    LYRICS_PARTIAL_MIN_INTERVAL_SEC,
-    PARTIAL_EVERY_N_CHUNKS,
-    PARTIAL_MIN_INTERVAL_SEC,
+    PARTIAL_AUDIO_MAX_SEC,
     PHRASE_TIMEOUT,
     PROFANITY_FILTER_DEFAULT,
     SAMPLE_RATE,
     SESSION_MAINTENANCE_CHUNKS,
+)
+from core.yamnet_categories import (
+    YAMNET_CATEGORY_IDS,
+    YAMNET_HOP_CHUNKS,
+    YAMNET_WINDOW_SAMPLES,
+    normalize_category,
 )
 from core.acoustics import (
     ConnectionAcoustics,
@@ -43,21 +45,28 @@ UTTERANCE_OVERLAP_CHUNKS: int = max(1, int(UTTERANCE_OVERLAP_SEC * CHUNKS_PER_SE
 
 gpu_lock: asyncio.Lock = asyncio.Lock()
 whisper_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+vad_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 sound_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+yamnet_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 diart_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
 INT16_FRAME_BYTES: int = CHUNK_SIZE * 2
 FLOAT_FRAME_BYTES: int = CHUNK_SIZE * 4
 
+def _sanitize_audio(audio: np.ndarray) -> np.ndarray:
+    if np.isfinite(audio).all():
+        return audio
+    return np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
 def _normalize_chunk(audio: np.ndarray) -> np.ndarray | None:
     if audio.size == CHUNK_SIZE:
-        return audio
+        return _sanitize_audio(audio)
     if audio.size > CHUNK_SIZE:
-        return audio[:CHUNK_SIZE].copy()
+        return _sanitize_audio(audio[:CHUNK_SIZE].copy())
     if audio.size > 0:
-        return np.pad(audio.astype(np.float32), (0, CHUNK_SIZE - int(audio.size)))
+        padded = np.pad(audio.astype(np.float32), (0, CHUNK_SIZE - int(audio.size)))
+        return _sanitize_audio(padded)
     return None
-
 
 def _decode_audio_frame(raw_bytes: bytes) -> np.ndarray | None:
     if not raw_bytes:
@@ -77,10 +86,36 @@ def _decode_audio_frame(raw_bytes: bytes) -> np.ndarray | None:
         return None
     return _normalize_chunk(audio)
 
-def _bytes_look_like_json_command(raw: bytes) -> bool:
-    s = raw.lstrip()
-    return bool(s) and s[:1] == b"{"
+def _parse_json_commands(raw: str | bytes) -> list[dict] | None:
+    if isinstance(raw, bytes):
+        s = raw.lstrip()
+        if not s or s[:1] != b"{":
+            return None
+        try:
+            text = s.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    else:
+        text = raw.lstrip()
+        if not text or text[0] != "{":
+            return None
 
+    commands: list[dict] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        try:
+            data, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            return commands if commands else None
+        if isinstance(data, dict) and data.get("type") is not None:
+            commands.append(data)
+        idx = end
+    return commands if commands else None
 
 def _prepare_audio(
     audio: np.ndarray,
@@ -89,18 +124,33 @@ def _prepare_audio(
 ) -> np.ndarray:
     if settings.skip_denoise:
         gain = ac.post_gain()
-        return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+        return _sanitize_audio(np.clip(audio * gain, -1.0, 1.0).astype(np.float32))
     reduced = nr.reduce_noise(
         y=audio,
         sr=SAMPLE_RATE,
         prop_decrease=ac.nr_prop_decrease(),
         stationary=ac.nr_stationary(),
+        n_fft=512,
+        hop_length=128,
     )
-    return np.clip(reduced * ac.post_gain(), -1.0, 1.0).astype(np.float32)
+    return _sanitize_audio(
+        np.clip(reduced * ac.post_gain(), -1.0, 1.0).astype(np.float32)
+    )
 
 def _current_speaker(settings: SessionSettings) -> str:
     return diarization.get_speaker_now(settings.speaker_lookback_sec)
 
+def _format_caption_speaker(
+    speaker: str,
+    *,
+    task: str,
+    language: str | None,
+) -> str:
+    normalized = diarization.speaker_client_id(speaker)
+    lang = (language or "").strip().lower()[:2]
+    if task == "translate" and lang and lang != "en":
+        return f"{normalized} ({lang})"
+    return normalized
 
 class WebSocketData:
     __slots__ = (
@@ -117,10 +167,12 @@ class WebSocketData:
         "task",
         "profanity_filter_enabled",
         "yamnet_profile",
+        "sfx_enabled_categories",
         "caption_env_telemetry",
         "acoustics",
         "yamnet_adaptive",
         "last_partial_monotonic",
+        "last_partial_chunk_count",
         "settings",
         "last_speech_monotonic",
         "speaker_timeline_reset",
@@ -131,6 +183,7 @@ class WebSocketData:
         "last_partial_text",
         "last_partial_speaker",
         "last_partial_language",
+        "translate_source_lang",
         "rollover_skip_chunks",
     )
 
@@ -143,15 +196,19 @@ class WebSocketData:
         self.silence_counter: float = 0
         self.utterance_start_time: float = time.monotonic()
         self.pre_roll: collections.deque = collections.deque(maxlen=10)
-        self.yamnet_buffer: collections.deque = collections.deque(maxlen=24000)
+        self.yamnet_buffer: collections.deque = collections.deque(
+            maxlen=YAMNET_WINDOW_SAMPLES
+        )
         self.chunk_counter: int = 0
         self.task: str = "transcribe"
         self.profanity_filter_enabled: bool = PROFANITY_FILTER_DEFAULT
         self.yamnet_profile: str = "default"
+        self.sfx_enabled_categories: set[str] = set(YAMNET_CATEGORY_IDS)
         self.caption_env_telemetry: bool = False
         self.acoustics: ConnectionAcoustics = ConnectionAcoustics()
         self.yamnet_adaptive: YamnetAdaptiveState = YamnetAdaptiveState()
         self.last_partial_monotonic: float = 0.0
+        self.last_partial_chunk_count: int = 0
         self.settings: SessionSettings = SessionSettings(
             phrase_timeout_sec=PHRASE_TIMEOUT
         )
@@ -164,6 +221,7 @@ class WebSocketData:
         self.last_partial_text: str = ""
         self.last_partial_speaker: str = ""
         self.last_partial_language: str | None = None
+        self.translate_source_lang: str | None = None
         self.rollover_skip_chunks: int = 0
 
 
@@ -173,6 +231,7 @@ async def handle_client_command(data: dict, client: WebSocketData) -> None:
     cmd = data.get("type")
     if cmd == "set_task":
         client.task = str(data.get("value", "transcribe"))
+        client.translate_source_lang = None
         logger.info("Task updated to: %s", client.task)
     elif cmd == "set_profanity_filter":
         client.profanity_filter_enabled = bool(data.get("value", False))
@@ -184,6 +243,23 @@ async def handle_client_command(data: dict, client: WebSocketData) -> None:
         else:
             client.yamnet_profile = "default"
         logger.info("YAMNet profile: %s", client.yamnet_profile)
+    elif cmd == "set_sfx_categories":
+        raw = data.get("value")
+        if isinstance(raw, list):
+            enabled = {
+                normalize_category(str(item))
+                for item in raw
+                if str(item).strip()
+            }
+            client.sfx_enabled_categories = {
+                cat for cat in enabled if cat in YAMNET_CATEGORY_IDS
+            }
+        elif raw is None:
+            client.sfx_enabled_categories = set(YAMNET_CATEGORY_IDS)
+        logger.info(
+            "SFX categories enabled: %s",
+            sorted(client.sfx_enabled_categories),
+        )
     elif cmd == "set_caption_telemetry":
         client.caption_env_telemetry = bool(data.get("value", False))
     elif cmd == "set_mode":
@@ -201,6 +277,16 @@ async def handle_client_command(data: dict, client: WebSocketData) -> None:
         if isinstance(updates, dict):
             applied = client.settings.patch(updates)
             logger.info("Patched settings: %s", applied)
+            if any(
+                k in applied
+                for k in (
+                    "partial_min_interval_sec",
+                    "partial_every_n_chunks",
+                    "partial_beam",
+                )
+            ):
+                client.last_partial_chunk_count = 0
+                client.last_partial_monotonic = 0.0
             await client.connection.send_json(
                 {"type": "settings", "patched": applied, "settings": client.settings.as_dict()}
             )
@@ -208,6 +294,25 @@ async def handle_client_command(data: dict, client: WebSocketData) -> None:
         await client.connection.send_json(
             {"type": "settings", "settings": client.settings.as_dict()}
         )
+
+async def _dispatch_client_commands(raw: str | bytes, client: WebSocketData) -> bool:
+    commands = _parse_json_commands(raw)
+    if not commands:
+        return False
+    preview = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    if len(commands) == 1:
+        logger.info("WS command (client %s): %s", client.uuid, commands[0])
+    else:
+        logger.info(
+            "WS commands (client %s, count=%d): %s",
+            client.uuid,
+            len(commands),
+            preview[:500],
+        )
+    for cmd in commands:
+        await handle_client_command(cmd, client)
+    return True
+
 
 def _gpu_cleanup() -> None:
     gc.collect()
@@ -219,7 +324,7 @@ def _gpu_cleanup() -> None:
     except Exception:
         pass
 
-async def _session_cleanup(websocket: WebSocketData) -> None:
+async def _session_maintenance(websocket: WebSocketData) -> None:
     logger.info(
         "Session maintenance at chunk %s (client %s)",
         websocket.chunk_counter,
@@ -294,9 +399,15 @@ async def _send_caption_message(
     *,
     language: str | None = None,
 ) -> None:
-    payload: dict = {"type": msg_type, "text": text, "speaker": speaker}
-    if language and websocket.task == "translate" and language != "en":
-        payload["language"] = language
+    display_speaker = _format_caption_speaker(
+        speaker,
+        task=websocket.task,
+        language=language,
+    )
+    payload: dict = {"type": msg_type, "text": text, "speaker": display_speaker}
+    lang = (language or "").strip().lower()[:2]
+    if lang and websocket.task == "translate" and lang != "en":
+        payload["language"] = lang
     if CAPTION_ENV_TELEMETRY or websocket.caption_env_telemetry:
         payload["env"] = websocket.acoustics.env_bucket
         payload["noise_score"] = round(float(websocket.acoustics.noise_score), 3)
@@ -317,22 +428,20 @@ async def create_connection(websocket: WebSocket) -> None:
 
             if message.get("bytes") is not None:
                 raw = message["bytes"]
-                if _bytes_look_like_json_command(raw):
-                    try:
-                        data = json.loads(raw.decode("utf-8"))
-                        if isinstance(data, dict) and data.get("type") is not None:
-                            await handle_client_command(data, client_connection)
-                            continue
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+                if raw.lstrip()[:1] == b"{" and await _dispatch_client_commands(
+                    raw, client_connection
+                ):
+                    continue
                 await process_websocket_bytes(raw, client_connection)
 
             elif message.get("text") is not None:
-                try:
-                    data = json.loads(message["text"])
-                    await handle_client_command(data, client_connection)
-                except json.JSONDecodeError as e:
-                    logger.error("Error parsing command: %s", e)
+                text = message["text"]
+                if text.lstrip().startswith("{"):
+                    if await _dispatch_client_commands(text, client_connection):
+                        continue
+                    logger.error("Error parsing command frame (raw=%r)", text[:500])
+                else:
+                    logger.warning("Ignored non-command text frame: %r", text[:200])
     except WebSocketDisconnect:
         logger.info("Disconnected with Client %s", generated_uuid)
     except Exception as e:
@@ -352,8 +461,14 @@ async def process_audio_task(
     loop = asyncio.get_running_loop()
     ac = websocket.acoustics
     settings = websocket.settings
-    denoise_fn = functools.partial(_prepare_audio, audio_data, ac, settings)
-    clean_audio = await loop.run_in_executor(sound_executor, denoise_fn)
+    if is_final and not settings.skip_denoise:
+        denoise_fn = functools.partial(_prepare_audio, audio_data, ac, settings)
+        clean_audio = await loop.run_in_executor(sound_executor, denoise_fn)
+    else:
+        gain = ac.post_gain()
+        clean_audio = _sanitize_audio(
+            np.clip(audio_data * gain, -1.0, 1.0).astype(np.float32)
+        )
 
     async with gpu_lock:
         websocket.is_transcribing = True
@@ -367,9 +482,16 @@ async def process_audio_task(
                 ac.noise_score,
                 settings,
                 fresh_context,
+                websocket.translate_source_lang,
             )
             text = result["text"].strip()
             lang = result.get("language") or None
+            if (
+                websocket.task == "translate"
+                and lang
+                and lang != "en"
+            ):
+                websocket.translate_source_lang = lang
             if is_final and not text and websocket.last_partial_text.strip():
                 text = websocket.last_partial_text.strip()
                 speaker_at_capture = websocket.last_partial_speaker or speaker_at_capture
@@ -398,29 +520,34 @@ async def process_audio_task(
         finally:
             websocket.is_transcribing = False
 
-
 def _max_utterance_chunks(settings: SessionSettings) -> int:
     return max(2, int(settings.max_utterance_sec * CHUNKS_PER_SEC))
-
 
 def _slice_voiced_audio(
     websocket: WebSocketData,
     *,
     end: int | None = None,
+    max_chunks: int | None = None,
 ) -> np.ndarray | None:
     buf = websocket.voiced_buffer
     start = websocket.rollover_skip_chunks
     stop = len(buf) if end is None else end
-    if stop <= start + 4:
+    if max_chunks is not None and stop - start > max_chunks:
+        start = stop - max_chunks
+    if stop <= start + 1:
         return None
     return np.concatenate(buf[start:stop])
 
 
-def _partial_cadence(settings: SessionSettings) -> tuple[int, float]:
-    if settings.content_mode == "lyrics":
-        return max(4, LYRICS_PARTIAL_EVERY_N_CHUNKS), LYRICS_PARTIAL_MIN_INTERVAL_SEC
-    return max(1, PARTIAL_EVERY_N_CHUNKS), PARTIAL_MIN_INTERVAL_SEC
+def _partial_cadence(settings: SessionSettings, task: str = "transcribe") -> tuple[int, float]:
+    _ = task
+    return (
+        max(1, int(settings.partial_every_n_chunks)),
+        max(0.0, float(settings.partial_min_interval_sec)),
+    )
 
+def _partial_max_chunks() -> int:
+    return max(8, int(PARTIAL_AUDIO_MAX_SEC * CHUNKS_PER_SEC))
 
 async def _flush_pending_partial(websocket: WebSocketData) -> None:
     try:
@@ -494,9 +621,11 @@ async def _flush_utterance(
         keep = max(1, overlap)
         websocket.voiced_buffer = list(websocket.voiced_buffer[-keep:])
         websocket.rollover_skip_chunks = len(websocket.voiced_buffer)
+        websocket.last_partial_chunk_count = 0
     else:
         websocket.voiced_buffer = []
         websocket.rollover_skip_chunks = 0
+        websocket.last_partial_chunk_count = 0
         websocket.is_speaking = False
         websocket.pre_roll.clear()
 
@@ -512,23 +641,25 @@ async def process_speaking(websocket: WebSocketData, audio_chunk: np.ndarray) ->
         websocket.last_partial_text = ""
         websocket.last_partial_speaker = ""
         websocket.last_partial_language = None
+        websocket.last_partial_chunk_count = 0
         websocket.voiced_buffer.extend(list(websocket.pre_roll))
     websocket.voiced_buffer.append(audio_chunk)
     websocket.silence_counter = 0
 
-    n, partial_interval = _partial_cadence(websocket.settings)
+    n, partial_interval = _partial_cadence(websocket.settings, websocket.task)
     new_audio_chunks = len(websocket.voiced_buffer) - websocket.rollover_skip_chunks
-    if (
-        new_audio_chunks >= n
-        and new_audio_chunks % n == 0
-    ):
+    chunks_since_partial = new_audio_chunks - websocket.last_partial_chunk_count
+    if new_audio_chunks >= n and chunks_since_partial >= n:
         if (
             partial_interval <= 0.0
             or (now - websocket.last_partial_monotonic) >= partial_interval
         ):
-            audio = _slice_voiced_audio(websocket)
+            audio = _slice_voiced_audio(
+                websocket, max_chunks=_partial_max_chunks()
+            )
             if audio is not None:
                 websocket.last_partial_monotonic = now
+                websocket.last_partial_chunk_count = new_audio_chunks
                 await _schedule_partial_transcription(
                     websocket,
                     audio,
@@ -564,6 +695,13 @@ async def process_silence(websocket: WebSocketData, audio_chunk: np.ndarray) -> 
             if silent_for >= websocket.settings.speaker_reset_sec:
                 diarization.reset_speaker_timeline()
                 websocket.speaker_timeline_reset = True
+                if websocket.translate_source_lang:
+                    logger.info(
+                        "Clearing translate source language %s after %.1fs silence",
+                        websocket.translate_source_lang,
+                        silent_for,
+                    )
+                websocket.translate_source_lang = None
                 logger.debug("Speaker timeline reset after %.1fs silence", silent_for)
 
 async def process_websocket_bytes(raw_bytes: bytes, websocket: WebSocketData) -> None:
@@ -580,22 +718,26 @@ async def process_websocket_bytes(raw_bytes: bytes, websocket: WebSocketData) ->
     websocket.yamnet_buffer.extend(audio_chunk)
     websocket.chunk_counter += 1
 
-    if websocket.chunk_counter % 8 == 0 and len(websocket.yamnet_buffer) == 24000:
+    hop = max(1, YAMNET_HOP_CHUNKS)
+    if (
+        websocket.chunk_counter % hop == 0
+        and len(websocket.yamnet_buffer) == YAMNET_WINDOW_SAMPLES
+    ):
         if not websocket.yamnet_inflight:
 
             async def ps(buf: np.ndarray, ws: WebSocketData) -> None:
                 ws.yamnet_inflight = True
                 try:
-                    exclude = {"music"} if ws.settings.content_mode == "lyrics" else None
+                    exclude = set(YAMNET_CATEGORY_IDS) - set(ws.sfx_enabled_categories)
                     fn = functools.partial(
                         diarization.get_sounds,
                         buf,
                         profile=ws.yamnet_profile,
                         adaptive=ws.yamnet_adaptive,
-                        exclude_categories=exclude,
+                        exclude_categories=exclude or None,
                         settings=ws.settings,
                     )
-                    detected = await loop.run_in_executor(sound_executor, fn)
+                    detected = await loop.run_in_executor(yamnet_executor, fn)
                     if detected:
                         combined_text = ", ".join(d["label"] for d in detected)
                         await ws.connection.send_json(
@@ -614,7 +756,7 @@ async def process_websocket_bytes(raw_bytes: bytes, websocket: WebSocketData) ->
             asyncio.create_task(ps(np.array(websocket.yamnet_buffer, copy=True), websocket))
 
     speech_prob: float = await loop.run_in_executor(
-        sound_executor, transcription.check_vad, audio_chunk
+        vad_executor, transcription.check_vad, audio_chunk
     )
     websocket.acoustics.update(audio_chunk, speech_prob, websocket.settings)
 

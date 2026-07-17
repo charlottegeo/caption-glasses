@@ -1,19 +1,22 @@
-import asyncio
 import gc
-import sys
 import time
 import pygame
 
 from client import theme
 from client import state as app_state
-from client.settings import reset_lyrics_settings, reset_speech_settings, settings_payload
-from client.state import invalidate_caption_cache, state
+from client.settings import (
+    reset_lyrics_settings,
+    reset_speech_settings,
+    settings_payload,
+    slider_stored_value,
+)
+from client.state import invalidate_caption_cache, state, state_lock
 from client.tuning_specs import (
+    ALL_SLIDER_SPECS,
     BTN_GAP,
     BTN_H,
     CLIENT_GC_INTERVAL_SEC,
     FOOTER_H,
-    FRAME_SEC,
     HEADER_H,
     LINE_H,
     MEDIA_SFX_DEFAULTS,
@@ -23,19 +26,22 @@ from client.tuning_specs import (
     SLIDER_SPECS,
     SFX_SLIDER_SPECS,
     SOUND_DISPLAY_DURATION,
-    TIP_H,
     YAMNET_PROFILES,
 )
+from client.sfx_categories import enabled_category_ids
 from client.ui.captions import get_caption_height, get_caption_lines, rebuild_captions
 from client.ui.noise_meter import draw_noise_meter
+from client.ui.sfx import draw_sound_labels
 from client.ui.sidebar import (
     btn_label,
     btn_ready,
     button_color,
     buttons_y,
     clamp,
+    draw_sfx_category_filters,
     draw_slider_row,
     fit_hint,
+    handle_sfx_category_hit,
     handle_slider_hit,
     sidebar_height,
     sidebar_x,
@@ -70,6 +76,15 @@ def paint_startup_frame(message: str = "Connecting…") -> None:
     theme.screen.blit(surf, (18, 14))
     pygame.display.flip()
 
+def _push_sfx_categories() -> None:
+    ws_send(
+        {
+            "type": "set_sfx_categories",
+            "value": enabled_category_ids(state.get("sfx_enabled_categories")),
+        }
+    )
+
+
 def _bootstrap_ws() -> None:
     if _frame["bootstrapped"]:
         return
@@ -77,6 +92,7 @@ def _bootstrap_ws() -> None:
     if state["caption_telemetry"]:
         ws_send({"type": "set_caption_telemetry", "value": True})
     ws_send({"type": "get_settings"})
+    _push_sfx_categories()
 
 def tick_frame() -> bool:
     _bootstrap_ws()
@@ -104,6 +120,8 @@ def tick_frame() -> bool:
             hit_slider = handle_slider_hit(event.pos, sb_x, scroll, track_w)
             if hit_slider:
                 state["dragging_slider"] = hit_slider
+            elif handle_sfx_category_hit(event.pos, sb_x, scroll, track_w):
+                _push_sfx_categories()
             else:
                 btn_y = buttons_y() - scroll
                 for i, name in enumerate(BTN_LABELS):
@@ -157,8 +175,17 @@ def tick_frame() -> bool:
                         invalidate_caption_cache()
                     break
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and state["dragging_slider"]:
+            key = state["dragging_slider"]
             state["dragging_slider"] = None
-            ws_send({"type": "set_settings", "value": settings_payload()})
+            spec = next(s for s in ALL_SLIDER_SPECS if s["key"] == key)
+            ws_send(
+                {
+                    "type": "set_settings",
+                    "value": {
+                        key: slider_stored_value(spec, state["slider_values"][key])
+                    },
+                }
+            )
         elif event.type == pygame.MOUSEMOTION and state["dragging_slider"]:
             key = state["dragging_slider"]
             track, spec = slider_track_for_key(key, sb_x, scroll, track_w)
@@ -210,6 +237,8 @@ def tick_frame() -> bool:
             SFX_SLIDER_COLORS,
         )
 
+    draw_sfx_category_filters(theme.screen, sb_x, scroll, track_w, mouse)
+
     btn_y = buttons_y() - scroll
     for i, name in enumerate(BTN_LABELS):
         rect = pygame.Rect(sb_x + SIDEBAR_PAD, btn_y + i * (BTN_H + BTN_GAP), track_w, BTN_H)
@@ -229,7 +258,7 @@ def tick_frame() -> bool:
         theme.screen.blit(txt, (rect.centerx - txt.get_width() // 2, rect.centery - txt.get_height() // 2))
 
     text_w = w - SIDEBAR_W - 36
-    cap_top = 12 + TIP_H
+    cap_top = 12
     cap_bottom = h - FOOTER_H
     rebuild_captions(text_w)
     caption_height = get_caption_height()
@@ -244,8 +273,13 @@ def tick_frame() -> bool:
             theme.screen.blit(surf, (18, dy))
     theme.screen.set_clip(None)
 
-    if state["sound_labels"] and pygame.time.get_ticks() - state["sound_timestamp"] < SOUND_DISPLAY_DURATION:
+    now_ms = int(time.monotonic() * 1000)
+    with state_lock:
+        has_sfx = bool(state.get("sound_labels"))
+        sound_timestamp = int(state.get("sound_timestamp") or 0)
+    if has_sfx and now_ms - sound_timestamp < SOUND_DISPLAY_DURATION:
         sfx_x = 110 if state["caption_telemetry"] else 18
+        draw_sound_labels(theme.screen, sfx_x, h - 28)
     if state["caption_telemetry"]:
         draw_noise_meter(theme.screen, 34, h - 34)
 
@@ -255,20 +289,19 @@ def tick_frame() -> bool:
     _frame["auto_scroll"] = auto_scroll
     return True
 
-async def run_pygame_loop() -> None:
+def run_pygame_loop() -> None:
+    """Blocking UI loop for the main thread. Network I/O runs elsewhere."""
+    clock = pygame.time.Clock()
     app_state._last_client_gc = time.monotonic()
+    _frame["bootstrapped"] = False
     while True:
         try:
             if not tick_frame():
-                pygame.quit()
-                sys.exit()
+                return
         except Exception as exc:
             print(f"UI frame error: {type(exc).__name__}: {exc}")
         now = time.monotonic()
         if now - app_state._last_client_gc >= CLIENT_GC_INTERVAL_SEC:
             gc.collect()
             app_state._last_client_gc = now
-        await asyncio.sleep(FRAME_SEC)
-
-async def pygame_loop(websocket):
-    await run_pygame_loop()
+        clock.tick(60)

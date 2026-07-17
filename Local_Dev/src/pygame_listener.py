@@ -1,15 +1,19 @@
 import argparse
-import asyncio
-import sys
+import time
 
 import pygame
-import websockets
 
 from config import WEBSOCKET_URI
 from client.state import init_state
 from client.theme import init_pygame
 from client.ui.loop import paint_startup_frame, run_pygame_loop
-from client.ws_client import init_queues, receive_text, send_audio, ws_outbound, ws_sender
+from client.ws_client import (
+    init_queues,
+    network_connected,
+    network_error,
+    start_network,
+    stop_network,
+)
 
 parser = argparse.ArgumentParser(description="Transcription Display")
 parser.add_argument(
@@ -25,40 +29,43 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-
-async def _cancel_tasks(tasks: list[asyncio.Task]) -> None:
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                print(f"Background task {i} failed: {type(result).__name__}: {result}")
+CONNECT_TIMEOUT_SEC = 30.0
 
 
-async def main():
+def _wait_for_connection() -> bool:
+    deadline = time.monotonic() + CONNECT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+        err = network_error()
+        if err is not None:
+            paint_startup_frame(f"Connection failed: {err}")
+            return False
+        if network_connected():
+            return True
+        paint_startup_frame()
+        time.sleep(0.05)
+    paint_startup_frame("Connection timed out")
+    return False
+
+
+def main() -> None:
     init_pygame()
     init_state(display_mode=args.mode, caption_telemetry=args.telemetry)
     init_queues()
     paint_startup_frame()
 
-    bg_tasks: list[asyncio.Task] = []
+    start_network(WEBSOCKET_URI)
     try:
-        async with websockets.connect(WEBSOCKET_URI) as websocket:
-            print("Connected to WebSocket.")
-            bg_tasks = [
-                asyncio.create_task(send_audio(websocket)),
-                asyncio.create_task(receive_text(websocket)),
-                asyncio.create_task(ws_sender(websocket)),
-                asyncio.create_task(ws_outbound(websocket)),
-            ]
-            await run_pygame_loop()
-    except Exception as e:
-        print(f"Connection Error: {e}")
+        if not _wait_for_connection():
+            time.sleep(1.5)
+            return
+        run_pygame_loop()
     finally:
-        await _cancel_tasks(bg_tasks)
+        stop_network()
         pygame.quit()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -27,12 +27,13 @@ from core.session_settings import SessionSettings
 def chunk_rms(audio: ndarray) -> float:
     if audio is None or len(audio) == 0:
         return 0.0
-    return float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
-
+    samples = audio.astype(np.float64)
+    if not np.isfinite(samples).all():
+        samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+    return float(np.sqrt(np.mean(np.square(samples))))
 
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * max(0.0, min(1.0, t))
-
 
 @dataclass
 class YamnetAdaptiveState:
@@ -57,7 +58,6 @@ class YamnetAdaptiveState:
             )
         else:
             self.pending_floor_delta = 0.0
-
 
 @dataclass
 class ConnectionAcoustics:

@@ -1,3 +1,4 @@
+import re
 import time
 import warnings
 import numpy as np
@@ -21,6 +22,7 @@ from config import (
     HF_TOKEN,
     SAMPLE_RATE,
     YAMNET_BASE_THRESHOLD,
+    YAMNET_DENOISE_STRENGTH,
     YAMNET_MAX_LABELS,
     YAMNET_MUSIC_THRESHOLD,
     YAMNET_NATURAL_THRESHOLD,
@@ -31,25 +33,16 @@ from config import (
 )
 from core.acoustics import YamnetAdaptiveState
 from core.session_settings import SessionSettings
+from core.yamnet_categories import (
+    TRANSIENT_THRESHOLD_DELTA,
+    VAGUE_SCORE_MARGIN,
+    YAMNET_TRANSIENT_INDICES,
+    YAMNET_VAGUE_LABELS,
+    category_for_index,
+    normalize_category,
+)
 
 yamnet_model: hub.KerasLayer = hub.load("https://tfhub.dev/google/yamnet/1")
-YAMNET_CATEGORY_RANGES: dict[str, range] = {
-    "human": range(0, 67),
-    "animal": range(67, 132),
-    "music": range(132, 277),
-    "natural": range(277, 294),
-    "vehicle": range(294, 348),
-    "domestic": range(348, 412),
-    "tools": range(412, 420),
-    "explosive": range(420, 456),
-    "misc": range(456, 521),
-}
-
-def _category_for_index(idx: int) -> str:
-    for cat_name, cat_range in YAMNET_CATEGORY_RANGES.items():
-        if idx in cat_range:
-            return cat_name
-    return "misc"
 
 class_map_path: bytes = yamnet_model.class_map_path().numpy()
 class_names: list[str] = []
@@ -94,10 +87,27 @@ diarization: SpeakerDiarization = SpeakerDiarization(diart_config)
 audio_source: WebSocketAudioSource = WebSocketAudioSource(SAMPLE_RATE)
 pipeline: StreamingInference = StreamingInference(diarization, audio_source)
 
-
 speaker_timeline: collections.deque[tuple[float, str]] = collections.deque(
     maxlen=200
 )
+
+_SPEAKER_RE = re.compile(r"speaker[_\s-]*(\d+)", re.IGNORECASE)
+
+def normalize_speaker_id(speaker: str | None) -> str:
+    if not speaker or not str(speaker).strip():
+        return "SPEAKER_00"
+    base = str(speaker).strip().split(" (", 1)[0].strip()
+    match = _SPEAKER_RE.search(base)
+    if match:
+        return f"SPEAKER_{int(match.group(1)):02d}"
+    return base.upper().replace(" ", "_")
+
+def speaker_client_id(speaker: str | None) -> str:
+    normalized = normalize_speaker_id(speaker)
+    match = _SPEAKER_RE.search(normalized)
+    if match:
+        return f"SPEAKER_{int(match.group(1)) + 1:02d}"
+    return normalized
 
 def on_diarization_update(result: tuple[Annotation] | Annotation) -> None:
     """
@@ -119,7 +129,9 @@ def on_diarization_update(result: tuple[Annotation] | Annotation) -> None:
         if not tracks:
             return
         latest_track: tuple[Segment, str, str] = max(tracks, key=lambda x: x[0].end)
-        speaker_timeline.append((time.monotonic(), latest_track[2]))
+        speaker_timeline.append(
+            (time.monotonic(), normalize_speaker_id(latest_track[2]))
+        )
     except Exception:
         return
 
@@ -172,6 +184,7 @@ def get_sounds(
     """
     Processes audio for sounds using category-based deduplication.
     Returns dicts: label, category, score.
+    Filtering is by enabled categories only — no hard-coded label skip list.
     """
     thr = _resolve_yamnet_thresholds(profile, settings)
     base_threshold = thr["base_threshold"]
@@ -182,7 +195,7 @@ def get_sounds(
     top_k = int(thr.get("top_k", YAMNET_TOP_K))
     max_labels = int(thr.get("max_labels", YAMNET_MAX_LABELS))
     skip_cats = exclude_categories or set()
-    denoise_strength = 0.45
+    denoise_strength = YAMNET_DENOISE_STRENGTH
     if settings is not None:
         denoise_strength = float(np.clip(settings.yamnet_denoise_strength, 0.0, 0.95))
 
@@ -194,25 +207,36 @@ def get_sounds(
     vehicle_threshold += floor_delta
     natural_threshold += floor_delta
 
-    if denoise_strength > 0.02:
+    if not np.isfinite(audio).all():
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if denoise_strength > 0.05:
         clean_audio = nr.reduce_noise(
             y=audio,
             sr=SAMPLE_RATE,
             stationary=True,
             prop_decrease=denoise_strength,
+            n_fft=512,
+            hop_length=128,
         )
     else:
         clean_audio = audio
+    if not np.isfinite(clean_audio).all():
+        clean_audio = np.nan_to_num(
+            clean_audio, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
     scores, _, _ = yamnet_model(clean_audio)
-    class_scores: tf.Tensor = tf.reduce_max(scores, axis=0)
+    class_scores: tf.Tensor = 0.55 * tf.reduce_max(scores, axis=0) + 0.45 * tf.reduce_mean(
+        scores, axis=0
+    )
 
     top_indices = tf.argsort(class_scores, direction="DESCENDING")[:top_k].numpy()
 
     candidates = []
     for idx in top_indices:
-        label = class_names[idx]
-        score = float(class_scores[idx].numpy())
-        assigned_cat = _category_for_index(int(idx))
+        idx_i = int(idx)
+        label = class_names[idx_i]
+        score = float(class_scores[idx_i].numpy())
+        assigned_cat = normalize_category(category_for_index(idx_i))
         if assigned_cat in skip_cats:
             continue
 
@@ -224,7 +248,12 @@ def get_sounds(
         elif assigned_cat == "music":
             th = music_threshold
 
-        if label in ["Silence", "Speech"] or score < th:
+        if idx_i in YAMNET_TRANSIENT_INDICES:
+            th = max(0.18, th - TRANSIENT_THRESHOLD_DELTA)
+        elif label in YAMNET_VAGUE_LABELS:
+            th = min(0.95, th + VAGUE_SCORE_MARGIN)
+
+        if score < th:
             continue
 
         candidates.append({"label": label, "score": score, "category": assigned_cat})
@@ -273,7 +302,7 @@ def get_speaker_now(lookback_sec: float = 0.35) -> str:
     now = time.monotonic()
     for ts, spk in reversed(speaker_timeline):
         if now - ts <= lookback_sec:
-            return spk
+            return normalize_speaker_id(spk)
     return "SPEAKER_00"
 
 def get_speaker_at(timestamp: float, max_age: float = 1.0) -> str:
@@ -292,10 +321,10 @@ def get_speaker_at(timestamp: float, max_age: float = 1.0) -> str:
 
     for ts, spk in reversed(speaker_timeline):
         if timestamp - 1.0 <= ts <= timestamp + max_age:
-            return spk
+            return normalize_speaker_id(spk)
         if ts <= timestamp + max_age:
             best = spk
             break
-    return best or "SPEAKER_00"
+    return normalize_speaker_id(best) if best else "SPEAKER_00"
 
 pipeline.stream.subscribe(on_diarization_update)

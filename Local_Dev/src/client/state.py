@@ -1,7 +1,10 @@
+import threading
 import time
+from client.sfx_categories import default_enabled_categories
 from client.tuning_specs import ALL_SLIDER_SPECS
 
 state: dict = {}
+state_lock = threading.Lock()
 _btn_last_click: dict[str, float] = {}
 _meter_cache: dict = {"size": 0, "surf": None}
 _last_client_gc = 0.0
@@ -25,6 +28,7 @@ def init_state(*, display_mode: str, caption_telemetry: bool) -> None:
             "sound": "",
             "sound_labels": [],
             "sound_timestamp": 0,
+            "sfx_enabled_categories": default_enabled_categories(),
             "translate_mode": False,
             "profanity_filter": False,
             "yamnet_profile_index": 0,
@@ -45,7 +49,6 @@ def init_state(*, display_mode: str, caption_telemetry: bool) -> None:
             "sidebar_scroll": 0,
             "dragging_slider": None,
             "last_caption_mono": 0.0,
-            "tuning_tip": "",
         }
     )
 
@@ -62,9 +65,11 @@ def invalidate_partial_cache() -> None:
     _partial_cache_key = None
 
 def trim_finals_history() -> None:
-    global _finals_block_cache
     from client.tuning_specs import MAX_SENTENCE_HISTORY
-    while len(state["finals"]) > MAX_SENTENCE_HISTORY:
-        state["finals"].pop(0)
-        if _finals_block_cache:
-            _finals_block_cache.pop(0)
+    trimmed = False
+    with state_lock:
+        while len(state["finals"]) > MAX_SENTENCE_HISTORY:
+            state["finals"].pop(0)
+            trimmed = True
+    if trimmed:
+        invalidate_caption_cache()

@@ -9,9 +9,12 @@ from client.state import (
     _partial_height,
     _partial_lines,
     state,
+    state_lock,
 )
 from client.theme import SPEAKER_COLORS
 from client.tuning_specs import LINE_H
+
+import re
 
 def wrap_text(text, font_obj, max_width):
     words = text.split(" ")
@@ -31,14 +34,38 @@ def wrap_text(text, font_obj, max_width):
 def _caption_body(item, is_partial: bool) -> str:
     body = item.get("text", "") + ("..." if is_partial else "")
     lang = (item.get("language") or "").strip().lower()[:2]
-    if state["translate_mode"] and lang and lang != "en":
+    speaker = item.get("speaker", "")
+    speaker_has_lang = " (" in speaker
+    if (
+        state["translate_mode"]
+        and lang
+        and lang != "en"
+        and not speaker_has_lang
+    ):
         body = f"[{lang}] {body}"
     return body
 
+def _base_speaker_id(speaker_id: str) -> str:
+    base = speaker_id.split(" (", 1)[0].strip()
+    match = re.match(r"speaker[_\s-]*(\d+)", base, re.IGNORECASE)
+    if match:
+        zero_based = max(0, int(match.group(1)) - 1)
+        return f"SPEAKER_{zero_based:02d}"
+    return "SPEAKER_00"
+
 def _speaker_label(speaker_id: str) -> str:
-    if speaker_id.startswith("SPEAKER_"):
-        return f"Speaker {int(speaker_id.split('_', 1)[1])}"
-    return speaker_id
+    lang = ""
+    if " (" in speaker_id:
+        speaker_id, lang_part = speaker_id.split(" (", 1)
+        lang = lang_part.rstrip(")")
+    match = re.match(r"speaker[_\s-]*(\d+)", speaker_id, re.IGNORECASE)
+    if match:
+        label = f"Speaker {int(match.group(1))}"
+    else:
+        label = speaker_id
+    if lang:
+        label = f"{label} ({lang})"
+    return label
 
 def _render_caption_items(items, text_w, *, mark_partial: bool = False):
     lines, y, last_spk = [], 0, None
@@ -46,10 +73,10 @@ def _render_caption_items(items, text_w, *, mark_partial: bool = False):
         if not item.get("text"):
             continue
         body = _caption_body(item, mark_partial)
-        speaker = item.get("speaker", "SPEAKER_00")
+        speaker = item.get("speaker", "SPEAKER_01")
         if not state.get("show_speakers", True):
-            speaker = "SPEAKER_00"
-        color = SPEAKER_COLORS.get(speaker, (240, 240, 240))
+            speaker = "SPEAKER_01"
+        color = SPEAKER_COLORS.get(_base_speaker_id(speaker), (240, 240, 240))
         for i, row in enumerate(wrap_text(body, theme.font, text_w)):
             if (
                 state.get("show_speakers", True)
@@ -74,18 +101,18 @@ def rebuild_captions(text_w):
     global _partial_cache_key, _partial_lines, _partial_height
     global _caption_lines, _caption_height
 
-    partial = state["partial"]
-    layout_key = (
-        text_w,
-        state["display_mode"],
-        state["translate_mode"],
-        state.get("show_speakers", True),
-    )
+    with state_lock:
+        finals = list(state["finals"])
+        partial = dict(state["partial"])
+        display_mode = state["display_mode"]
+        translate_mode = state["translate_mode"]
+        show_speakers = state.get("show_speakers", True)
+
+    layout_key = (text_w, display_mode, translate_mode, show_speakers)
     if layout_key != _finals_layout_key:
         _finals_layout_key = layout_key
         _finals_block_cache.clear()
 
-    finals = state["finals"]
     while len(_finals_block_cache) > len(finals):
         _finals_block_cache.pop(0)
 
@@ -116,9 +143,9 @@ def rebuild_captions(text_w):
         partial.get("speaker"),
         partial.get("language"),
         text_w,
-        state["display_mode"],
-        state["translate_mode"],
-        state.get("show_speakers", True),
+        display_mode,
+        translate_mode,
+        show_speakers,
     )
     if partial_key != _partial_cache_key:
         _partial_cache_key = partial_key
@@ -136,6 +163,8 @@ def rebuild_captions(text_w):
         _caption_height = _finals_height + _partial_height
 
 def parse_sound_labels(msg) -> list[dict]:
+    from client.sfx_categories import normalize_sfx_category
+
     raw = msg.get("labels")
     if isinstance(raw, list) and raw:
         out = []
@@ -144,16 +173,20 @@ def parse_sound_labels(msg) -> list[dict]:
                 out.append(
                     {
                         "label": str(entry["label"]),
-                        "category": str(entry.get("category") or "misc"),
+                        "category": normalize_sfx_category(entry.get("category")),
                     }
                 )
             elif isinstance(entry, str) and entry.strip():
-                out.append({"label": entry.strip(), "category": "misc"})
+                out.append({"label": entry.strip(), "category": "ambient"})
         return out
     text = (msg.get("text") or "").strip()
     if not text:
         return []
-    return [{"label": part.strip(), "category": "misc"} for part in text.split(",") if part.strip()]
+    return [
+        {"label": part.strip(), "category": "ambient"}
+        for part in text.split(",")
+        if part.strip()
+    ]
 
 def get_caption_lines():
     return _caption_lines
