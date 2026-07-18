@@ -13,6 +13,11 @@ YAMNET_ADAPT_ALPHA: float = env_float("YAMNET_ADAPT_ALPHA", "0.12")
 YAMNET_ADAPT_FLOOR_DELTA_MAX: float = env_float("YAMNET_ADAPT_FLOOR_DELTA_MAX", "0.04")
 YAMNET_DENOISE_STRENGTH: float = env_float("YAMNET_DENOISE_STRENGTH", "0.15")
 
+SFX_LABEL_TTL_SEC: float = env_float("SFX_LABEL_TTL_SEC", "3.0")
+SFX_KEEPALIVE_SEC: float = env_float("SFX_KEEPALIVE_SEC", "2.0")
+SFX_HYSTERESIS_WINDOWS: int = env_int("SFX_HYSTERESIS_WINDOWS", "2")
+SFX_DENOISE_MIN_NOISE_SCORE: float = env_float("SFX_DENOISE_MIN_NOISE_SCORE", "0.28")
+
 _yamnet_presets_raw = get_env_variable("YAMNET_PROFILE_PRESETS", "")
 if _yamnet_presets_raw:
     try:

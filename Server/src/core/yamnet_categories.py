@@ -33,6 +33,18 @@ YAMNET_VAGUE_LABELS: frozenset[str] = frozenset(
     }
 )
 
+YAMNET_SPEECH_LABELS: frozenset[str] = frozenset(
+    {
+        "Speech",
+        "Child speech, kid speaking",
+        "Conversation",
+        "Narration, monologue",
+        "Babbling",
+        "Speech synthesizer",
+        "Whispering",
+    }
+)
+
 YAMNET_TRANSIENT_INDICES: frozenset[int] = frozenset(
     {
         35,   # Whistling

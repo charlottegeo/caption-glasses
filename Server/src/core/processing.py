@@ -3,6 +3,7 @@ import collections
 import functools
 import gc
 import json
+import threading
 import time
 import uuid
 import noisereduce as nr
@@ -34,6 +35,7 @@ from core.acoustics import (
     effective_silence_limit,
 )
 from core.session_settings import MODE_NAMES, SessionSettings
+from core.sfx import SfxTracker
 from modules import diarization, profanity_filter, transcription
 
 logger: Logger = getLogger(__name__)
@@ -52,6 +54,46 @@ diart_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
 INT16_FRAME_BYTES: int = CHUNK_SIZE * 2
 FLOAT_FRAME_BYTES: int = CHUNK_SIZE * 4
+GPU_LOCK_SLOW_WAIT_SEC: float = 0.5
+DENOISE_MIN_NOISE_SCORE: float = 0.28
+PARTIAL_UNSTABLE_TAIL_TOKENS: int = 2
+
+DIART_MAX_PENDING_CHUNKS: int = 8
+DIART_DROP_LOG_EVERY: int = 200
+
+_diart_pending: int = 0
+_diart_dropped: int = 0
+_diart_lock: threading.Lock = threading.Lock()
+
+def _diart_push(chunk: np.ndarray) -> None:
+    global _diart_pending
+    try:
+        diarization.audio_source.push_audio(chunk)
+    except Exception as e:
+        logger.error("Diart push error: %s", e)
+    finally:
+        with _diart_lock:
+            _diart_pending -= 1
+
+def _submit_diart_chunk(loop: asyncio.AbstractEventLoop, chunk: np.ndarray) -> None:
+    global _diart_pending, _diart_dropped
+    with _diart_lock:
+        if _diart_pending >= DIART_MAX_PENDING_CHUNKS:
+            _diart_dropped += 1
+            dropped = _diart_dropped
+            pending = _diart_pending
+            submit = False
+        else:
+            _diart_pending += 1
+            submit = True
+    if submit:
+        loop.run_in_executor(diart_executor, _diart_push, chunk.copy())
+    elif dropped % DIART_DROP_LOG_EVERY == 1:
+        logger.warning(
+            "Diarization behind real time; dropped %d chunks so far (pending=%d)",
+            dropped,
+            pending,
+        )
 
 def _sanitize_audio(audio: np.ndarray) -> np.ndarray:
     if np.isfinite(audio).all():
@@ -179,12 +221,15 @@ class WebSocketData:
         "lyrics_vad_hangover",
         "partial_transcription_inflight",
         "yamnet_inflight",
+        "pending_yamnet",
+        "sfx_tracker",
         "pending_partial",
         "last_partial_text",
         "last_partial_speaker",
         "last_partial_language",
         "translate_source_lang",
         "rollover_skip_chunks",
+        "prefer_final",
     )
 
     def __init__(self, websocket: WebSocket, uuid_str: str):
@@ -217,12 +262,99 @@ class WebSocketData:
         self.lyrics_vad_hangover: int = 0
         self.partial_transcription_inflight: bool = False
         self.yamnet_inflight: bool = False
-        self.pending_partial: tuple[np.ndarray, str] | None = None
+        self.pending_yamnet: np.ndarray | None = None
+        self.sfx_tracker: SfxTracker = SfxTracker()
+        self.pending_partial: tuple[np.ndarray, str, bool] | None = None
         self.last_partial_text: str = ""
         self.last_partial_speaker: str = ""
         self.last_partial_language: str | None = None
         self.translate_source_lang: str | None = None
         self.rollover_skip_chunks: int = 0
+        self.prefer_final: bool = False
+
+
+def _merge_stable_partial(
+    prev: str,
+    new: str,
+    *,
+    unstable_tail: int = PARTIAL_UNSTABLE_TAIL_TOKENS,
+) -> str:
+    prev = (prev or "").strip()
+    new = (new or "").strip()
+    if not new:
+        return prev
+    if not prev:
+        return new
+
+    prev_toks = prev.split()
+    new_toks = new.split()
+
+    common = 0
+    for a, b in zip(prev_toks, new_toks):
+        if a == b:
+            common += 1
+        else:
+            break
+
+    if common == len(prev_toks):
+        return " ".join(new_toks)
+    if common == len(new_toks) and len(new_toks) <= len(prev_toks):
+        return prev
+
+    lock_len = max(0, len(prev_toks) - max(1, int(unstable_tail)))
+    if common >= lock_len and len(new_toks) >= lock_len:
+        return " ".join(prev_toks[:lock_len] + new_toks[lock_len:])
+    if len(new_toks) > lock_len:
+        return " ".join(prev_toks[:lock_len] + new_toks[lock_len:])
+    return prev
+
+
+_TOKEN_STRIP_CHARS = ".,!?;:…\"'()[]"
+
+
+def _norm_token(tok: str) -> str:
+    return tok.strip(_TOKEN_STRIP_CHARS).lower()
+
+
+def _stitch_sliding_partial(
+    prev: str,
+    new: str,
+    *,
+    unstable_tail: int = PARTIAL_UNSTABLE_TAIL_TOKENS,
+) -> str:
+    prev = (prev or "").strip()
+    new = (new or "").strip()
+    if not new:
+        return prev
+    if not prev:
+        return new
+
+    prev_toks = prev.split()
+    new_toks = new.split()
+    tail = max(1, int(unstable_tail))
+    if len(prev_toks) <= tail:
+        return new if len(new_toks) >= len(prev_toks) else prev
+
+    norm_new = [_norm_token(t) for t in new_toks]
+    for tail_drop in range(0, tail + 1):
+        end = len(prev_toks) - tail_drop
+        for anchor_len in (4, 3, 2):
+            if end < anchor_len:
+                continue
+            anchor = [_norm_token(t) for t in prev_toks[end - anchor_len : end]]
+            if not all(anchor):
+                continue
+            for j in range(len(new_toks) - anchor_len, -1, -1):
+                if norm_new[j : j + anchor_len] == anchor:
+                    return " ".join(prev_toks[:end] + new_toks[j + anchor_len :])
+    return prev
+
+
+def _clear_partial_state(websocket: WebSocketData) -> None:
+    websocket.last_partial_text = ""
+    websocket.last_partial_speaker = ""
+    websocket.last_partial_language = None
+    websocket.pending_partial = None
 
 
 async def handle_client_command(data: dict, client: WebSocketData) -> None:
@@ -332,6 +464,8 @@ async def _session_maintenance(websocket: WebSocketData) -> None:
     )
     diarization.reset_streaming_state()
     websocket.yamnet_adaptive = YamnetAdaptiveState()
+    websocket.sfx_tracker = SfxTracker()
+    websocket.pending_yamnet = None
     websocket.acoustics.recenter_for_long_session()
     if len(websocket.voiced_buffer) > websocket.rollover_skip_chunks + 4:
         await _flush_utterance(websocket, rolling=False, await_completion=True)
@@ -340,6 +474,11 @@ async def _session_maintenance(websocket: WebSocketData) -> None:
     websocket.is_speaking = False
     websocket.silence_counter = 0
     websocket.lyrics_vad_hangover = 0
+    _clear_partial_state(websocket)
+    websocket.translate_source_lang = None
+    websocket.prefer_final = False
+    websocket.last_partial_chunk_count = 0
+    websocket.last_partial_monotonic = 0.0
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(sound_executor, _gpu_cleanup)
 
@@ -398,6 +537,7 @@ async def _send_caption_message(
     speaker: str,
     *,
     language: str | None = None,
+    revise: bool = False,
 ) -> None:
     display_speaker = _format_caption_speaker(
         speaker,
@@ -408,6 +548,8 @@ async def _send_caption_message(
     lang = (language or "").strip().lower()[:2]
     if lang and websocket.task == "translate" and lang != "en":
         payload["language"] = lang
+    if revise and msg_type == "final":
+        payload["revise"] = True
     if CAPTION_ENV_TELEMETRY or websocket.caption_env_telemetry:
         payload["env"] = websocket.acoustics.env_bucket
         payload["noise_score"] = round(float(websocket.acoustics.noise_score), 3)
@@ -454,14 +596,24 @@ async def process_audio_task(
     is_final: bool = True,
     *,
     fresh_context: bool = False,
+    revise: bool = False,
+    provisional_text: str = "",
+    window_slid: bool = False,
 ) -> None:
     if audio_data is None or len(audio_data) == 0:
+        return
+    if not is_final and websocket.prefer_final:
         return
 
     loop = asyncio.get_running_loop()
     ac = websocket.acoustics
     settings = websocket.settings
-    if is_final and not settings.skip_denoise:
+    use_denoise = (
+        is_final
+        and not settings.skip_denoise
+        and float(ac.noise_score) >= DENOISE_MIN_NOISE_SCORE
+    )
+    if use_denoise:
         denoise_fn = functools.partial(_prepare_audio, audio_data, ac, settings)
         clean_audio = await loop.run_in_executor(sound_executor, denoise_fn)
     else:
@@ -470,55 +622,111 @@ async def process_audio_task(
             np.clip(audio_data * gain, -1.0, 1.0).astype(np.float32)
         )
 
-    async with gpu_lock:
-        websocket.is_transcribing = True
-        try:
-            result = await loop.run_in_executor(
-                whisper_executor,
-                transcription.get_speech,
-                clean_audio,
-                is_final,
-                websocket.task,
-                ac.noise_score,
-                settings,
-                fresh_context,
-                websocket.translate_source_lang,
-            )
-            text = result["text"].strip()
-            lang = result.get("language") or None
-            if (
-                websocket.task == "translate"
-                and lang
-                and lang != "en"
-            ):
-                websocket.translate_source_lang = lang
-            if is_final and not text and websocket.last_partial_text.strip():
-                text = websocket.last_partial_text.strip()
-                speaker_at_capture = websocket.last_partial_speaker or speaker_at_capture
-                lang = websocket.last_partial_language or lang
-                logger.debug("Sending last partial as final (%d chars)", len(text))
-            if text:
-                text = profanity_filter.mask_caption_text(
-                    text, websocket.profanity_filter_enabled
-                )
-                if not text:
-                    return
-                msg_type = "final" if is_final else "partial"
-                if not is_final:
-                    websocket.last_partial_text = text
+    if not is_final and websocket.prefer_final:
+        return
+
+    wait_start = time.monotonic()
+    await gpu_lock.acquire()
+    waited = time.monotonic() - wait_start
+    if waited >= GPU_LOCK_SLOW_WAIT_SEC:
+        logger.info(
+            "GPU lock wait %.2fs (final=%s, client=%s)",
+            waited,
+            is_final,
+            websocket.uuid,
+        )
+    websocket.is_transcribing = True
+    try:
+        if not is_final and websocket.prefer_final:
+            return
+        result = await loop.run_in_executor(
+            whisper_executor,
+            transcription.get_speech,
+            clean_audio,
+            is_final,
+            websocket.task,
+            ac.noise_score,
+            settings,
+            fresh_context,
+            websocket.translate_source_lang,
+        )
+        if not is_final and websocket.prefer_final:
+            return
+        text = result["text"].strip()
+        lang = result.get("language") or None
+        if (
+            websocket.task == "translate"
+            and lang
+            and lang != "en"
+        ):
+            websocket.translate_source_lang = lang
+        if is_final and not text and websocket.last_partial_text.strip():
+            text = websocket.last_partial_text.strip()
+            speaker_at_capture = websocket.last_partial_speaker or speaker_at_capture
+            lang = websocket.last_partial_language or lang
+            logger.debug("Sending last partial as final (%d chars)", len(text))
+        if not is_final:
+            if window_slid:
+                text = _stitch_sliding_partial(websocket.last_partial_text, text)
+            else:
+                text = _merge_stable_partial(websocket.last_partial_text, text)
+            if not text or text == websocket.last_partial_text.strip():
+                if text:
                     websocket.last_partial_speaker = speaker_at_capture
                     websocket.last_partial_language = lang
-                else:
-                    websocket.last_partial_text = ""
-                    websocket.last_partial_speaker = ""
-                    websocket.last_partial_language = None
-                await _send_caption_message(
-                    websocket, msg_type, text, speaker_at_capture, language=lang
-                )
-        except Exception as e:
-            logger.exception("Transcription Error: %s", e)
-        finally:
-            websocket.is_transcribing = False
+                return
+            text = profanity_filter.mask_caption_text(
+                text, websocket.profanity_filter_enabled
+            )
+            if not text:
+                return
+            websocket.last_partial_text = text
+            websocket.last_partial_speaker = speaker_at_capture
+            websocket.last_partial_language = lang
+            await _send_caption_message(
+                websocket, "partial", text, speaker_at_capture, language=lang
+            )
+            return
+
+        provisional = (provisional_text or "").strip()
+        if not text:
+            if revise and provisional:
+                _clear_partial_state(websocket)
+                return
+            _clear_partial_state(websocket)
+            return
+
+        text = profanity_filter.mask_caption_text(
+            text, websocket.profanity_filter_enabled
+        )
+        if not text:
+            if revise and provisional:
+                _clear_partial_state(websocket)
+                return
+            _clear_partial_state(websocket)
+            return
+
+        if revise and provisional and text == provisional:
+            _clear_partial_state(websocket)
+            return
+
+        await _send_caption_message(
+            websocket,
+            "final",
+            text,
+            speaker_at_capture,
+            language=lang,
+            revise=bool(revise and provisional),
+        )
+        _clear_partial_state(websocket)
+    except Exception as e:
+        logger.exception("Transcription Error: %s", e)
+    finally:
+        websocket.is_transcribing = False
+        if is_final:
+            websocket.prefer_final = False
+        gpu_lock.release()
+
 
 def _max_utterance_chunks(settings: SessionSettings) -> int:
     return max(2, int(settings.max_utterance_sec * CHUNKS_PER_SEC))
@@ -551,15 +759,21 @@ def _partial_max_chunks() -> int:
 
 async def _flush_pending_partial(websocket: WebSocketData) -> None:
     try:
-        while websocket.pending_partial is not None:
-            audio_data, speaker = websocket.pending_partial
+        while (
+            websocket.pending_partial is not None and not websocket.prefer_final
+        ):
+            audio_data, speaker, window_slid = websocket.pending_partial
             websocket.pending_partial = None
             await process_audio_task(
-                websocket, audio_data, speaker, is_final=False
+                websocket,
+                audio_data,
+                speaker,
+                is_final=False,
+                window_slid=window_slid,
             )
     finally:
         websocket.partial_transcription_inflight = False
-        if websocket.pending_partial is not None:
+        if websocket.pending_partial is not None and not websocket.prefer_final:
             websocket.partial_transcription_inflight = True
             asyncio.create_task(_flush_pending_partial(websocket))
 
@@ -570,9 +784,12 @@ async def _schedule_partial_transcription(
     *,
     is_final: bool,
     fresh_context: bool = False,
+    window_slid: bool = False,
 ) -> None:
     if not is_final:
-        websocket.pending_partial = (audio_data.copy(), speaker)
+        if websocket.prefer_final:
+            return
+        websocket.pending_partial = (audio_data.copy(), speaker, window_slid)
         if websocket.partial_transcription_inflight:
             return
         websocket.partial_transcription_inflight = True
@@ -580,6 +797,7 @@ async def _schedule_partial_transcription(
         return
 
     websocket.pending_partial = None
+    websocket.prefer_final = True
     asyncio.create_task(
         process_audio_task(
             websocket,
@@ -605,13 +823,40 @@ async def _flush_utterance(
         audio = _slice_voiced_audio(websocket)
     if audio is None:
         return
+
     speaker = _current_speaker(websocket.settings)
+    websocket.pending_partial = None
+    websocket.prefer_final = True
+
+    provisional = ""
+    sent_provisional = False
+    if not rolling:
+        provisional = websocket.last_partial_text.strip()
+        provisional_speaker = websocket.last_partial_speaker or speaker
+        provisional_lang = websocket.last_partial_language
+        if provisional:
+            masked = profanity_filter.mask_caption_text(
+                provisional, websocket.profanity_filter_enabled
+            )
+            if masked:
+                await _send_caption_message(
+                    websocket,
+                    "final",
+                    masked,
+                    provisional_speaker,
+                    language=provisional_lang,
+                )
+                sent_provisional = True
+                provisional = masked
+
     task = process_audio_task(
         websocket,
         audio,
         speaker,
         is_final=True,
         fresh_context=rolling,
+        revise=sent_provisional,
+        provisional_text=provisional if sent_provisional else "",
     )
     if await_completion:
         await task
@@ -638,9 +883,8 @@ async def process_speaking(websocket: WebSocketData, audio_chunk: np.ndarray) ->
         websocket.is_speaking = True
         websocket.utterance_start_time = now
         websocket.rollover_skip_chunks = 0
-        websocket.last_partial_text = ""
-        websocket.last_partial_speaker = ""
-        websocket.last_partial_language = None
+        websocket.prefer_final = False
+        _clear_partial_state(websocket)
         websocket.last_partial_chunk_count = 0
         websocket.voiced_buffer.extend(list(websocket.pre_roll))
     websocket.voiced_buffer.append(audio_chunk)
@@ -654,9 +898,8 @@ async def process_speaking(websocket: WebSocketData, audio_chunk: np.ndarray) ->
             partial_interval <= 0.0
             or (now - websocket.last_partial_monotonic) >= partial_interval
         ):
-            audio = _slice_voiced_audio(
-                websocket, max_chunks=_partial_max_chunks()
-            )
+            max_chunks = _partial_max_chunks()
+            audio = _slice_voiced_audio(websocket, max_chunks=max_chunks)
             if audio is not None:
                 websocket.last_partial_monotonic = now
                 websocket.last_partial_chunk_count = new_audio_chunks
@@ -665,6 +908,7 @@ async def process_speaking(websocket: WebSocketData, audio_chunk: np.ndarray) ->
                     audio,
                     _current_speaker(websocket.settings),
                     is_final=False,
+                    window_slid=new_audio_chunks > max_chunks,
                 )
 
     if len(websocket.voiced_buffer) >= _max_utterance_chunks(websocket.settings):
@@ -711,9 +955,7 @@ async def process_websocket_bytes(raw_bytes: bytes, websocket: WebSocketData) ->
     if audio_chunk is None:
         return
 
-    loop.run_in_executor(
-        diart_executor, diarization.audio_source.push_audio, audio_chunk.copy()
-    )
+    _submit_diart_chunk(loop, audio_chunk)
 
     websocket.yamnet_buffer.extend(audio_chunk)
     websocket.chunk_counter += 1
@@ -723,31 +965,43 @@ async def process_websocket_bytes(raw_bytes: bytes, websocket: WebSocketData) ->
         websocket.chunk_counter % hop == 0
         and len(websocket.yamnet_buffer) == YAMNET_WINDOW_SAMPLES
     ):
-        if not websocket.yamnet_inflight:
+        if websocket.yamnet_inflight:
+            websocket.pending_yamnet = np.array(websocket.yamnet_buffer, copy=True)
+        else:
 
             async def ps(buf: np.ndarray, ws: WebSocketData) -> None:
                 ws.yamnet_inflight = True
                 try:
-                    exclude = set(YAMNET_CATEGORY_IDS) - set(ws.sfx_enabled_categories)
-                    fn = functools.partial(
-                        diarization.get_sounds,
-                        buf,
-                        profile=ws.yamnet_profile,
-                        adaptive=ws.yamnet_adaptive,
-                        exclude_categories=exclude or None,
-                        settings=ws.settings,
-                    )
-                    detected = await loop.run_in_executor(yamnet_executor, fn)
-                    if detected:
-                        combined_text = ", ".join(d["label"] for d in detected)
-                        await ws.connection.send_json(
-                            {
-                                "type": "sound",
-                                "text": combined_text,
-                                "labels": detected,
-                                "speaker": "",
-                            }
+                    current: np.ndarray | None = buf
+                    while current is not None:
+                        exclude = set(YAMNET_CATEGORY_IDS) - set(
+                            ws.sfx_enabled_categories
                         )
+                        fn = functools.partial(
+                            diarization.get_sounds,
+                            current,
+                            profile=ws.yamnet_profile,
+                            adaptive=ws.yamnet_adaptive,
+                            exclude_categories=exclude or None,
+                            settings=ws.settings,
+                            noise_score=float(ws.acoustics.noise_score),
+                        )
+                        detected = await loop.run_in_executor(yamnet_executor, fn)
+                        to_send = ws.sfx_tracker.update(
+                            detected,
+                            max_labels=int(ws.settings.yamnet_max_labels),
+                        )
+                        if to_send:
+                            combined_text = ", ".join(d["label"] for d in to_send)
+                            await ws.connection.send_json(
+                                {
+                                    "type": "sound",
+                                    "text": combined_text,
+                                    "labels": to_send,
+                                    "speaker": "",
+                                }
+                            )
+                        current, ws.pending_yamnet = ws.pending_yamnet, None
                 except Exception as e:
                     logger.error("YAMNet Error: %s", e)
                 finally:

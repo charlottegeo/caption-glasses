@@ -21,12 +21,12 @@ SLIDER_SPECS = [
     {
         "key": "partial_min_interval_sec",
         "label": "Partial delay",
-        "min": 0.05, "max": 0.60, "step": 0.05, "default": 0.12, "fmt": ".2f", "suffix": "s",
+        "min": 0.05, "max": 0.60, "step": 0.05, "default": 0.25, "fmt": ".2f", "suffix": "s",
     },
     {
         "key": "partial_every_n_chunks",
         "label": "Partial stride",
-        "min": 1, "max": 12, "step": 1, "default": 1, "fmt": "d",
+        "min": 1, "max": 12, "step": 1, "default": 3, "fmt": "d",
     },
     {
         "key": "partial_beam",
