@@ -18,11 +18,19 @@ _caption_lines: list[tuple] = []
 _caption_height = 0
 _finals_height = 0
 
-def init_state(*, display_mode: str, caption_telemetry: bool) -> None:
+def init_state(
+    *,
+    display_mode: str,
+    caption_telemetry: bool,
+    enable_mic: bool = True,
+    show_sidebar: bool = True,
+) -> None:
     state.clear()
     state.update(
         {
             "display_mode": display_mode,
+            "enable_mic": enable_mic,
+            "show_sidebar": show_sidebar,
             "finals": [],
             "partial": {"text": "", "speaker": ""},
             "sound": "",

@@ -30,8 +30,10 @@ pip install -r dev-requirements.txt
 - Wait until the webserver starts on port **8080**, this will take upwards of 4 minutes.
   - You can verify this by going to localhost:8080, if it is up, it will redirect you to the documentation.
 - Mic sample rate defaults to auto-detect (`DEVICE_CAPTURE_RATE=auto` in `Local_Dev/src/.env`). Set a number only to force a specific rate.
-- Once started, run the **pygame_listener.py** script located in Local_Dev/src
-- If everything is correct, the transcription app should appear and connect, automatically transcribing from your microphone
+- Once started, run the **pygame_listener.py** script located in Local_Dev/src:
+  - `python pygame_listener.py` — listen with mic + tuning sidebar (default)
+  - `python pygame_listener.py --role monitor` — display-only (captions + SFX, no mic/sidebar)
+- If everything is correct, the transcription app should appear and connect, automatically transcribing from your microphone (listen role)
 
 ## WebSocket API
 

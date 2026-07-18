@@ -17,6 +17,15 @@ from client.ws_client import (
 
 parser = argparse.ArgumentParser(description="Transcription Display")
 parser.add_argument(
+    "--role",
+    choices=["listen", "monitor"],
+    default="listen",
+    help=(
+        "listen: capture mic and show tuning sidebar (default). "
+        "monitor: display captions/SFX only — no mic, no sidebar."
+    ),
+)
+parser.add_argument(
     "--mode",
     choices=["label", "color"],
     default="label",
@@ -51,10 +60,18 @@ def _wait_for_connection() -> bool:
 
 
 def main() -> None:
+    is_monitor = args.role == "monitor"
     init_pygame()
-    init_state(display_mode=args.mode, caption_telemetry=args.telemetry)
+    if is_monitor:
+        pygame.display.set_caption("Captioning Monitor")
+    init_state(
+        display_mode=args.mode,
+        caption_telemetry=args.telemetry,
+        enable_mic=not is_monitor,
+        show_sidebar=not is_monitor,
+    )
     init_queues()
-    paint_startup_frame()
+    paint_startup_frame("Connecting…" if not is_monitor else "Connecting (monitor)…")
 
     start_network(WEBSOCKET_URI)
     try:

@@ -6,12 +6,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pyaudio
+import pyaudio 
 import websockets
 
 from config import DEVICE_CAPTURE_RATE
 from client.settings import apply_settings_from_server, update_telemetry
 from client.state import (
+    invalidate_caption_cache,
     invalidate_partial_cache,
     mark_caption_received,
     state,
@@ -291,16 +292,21 @@ async def receive_text(websocket):
                 mark_caption_received()
                 update_telemetry(msg)
             elif t == "final":
+                entry = {
+                    "text": msg["text"],
+                    "speaker": msg.get("speaker", "SPEAKER_01"),
+                    "language": msg.get("language"),
+                }
                 with state_lock:
-                    state["finals"].append(
-                        {
-                            "text": msg["text"],
-                            "speaker": msg.get("speaker", "SPEAKER_01"),
-                            "language": msg.get("language"),
-                        }
-                    )
+                    if msg.get("revise") and state["finals"]:
+                        state["finals"][-1] = entry
+                    else:
+                        state["finals"].append(entry)
                     state["partial"] = {"text": "", "speaker": ""}
-                invalidate_partial_cache()
+                if msg.get("revise"):
+                    invalidate_caption_cache()
+                else:
+                    invalidate_partial_cache()
                 mark_caption_received()
                 trim_finals_history()
                 update_telemetry(msg)
