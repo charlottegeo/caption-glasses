@@ -348,12 +348,13 @@ async def _network_main(uri: str, stop: threading.Event) -> None:
             _net["connected"].set()
             print("Connected to WebSocket.")
             tasks = [
-                asyncio.create_task(send_audio(), name="send_audio"),
                 asyncio.create_task(receive_text(websocket), name="receive_text"),
                 asyncio.create_task(ws_sender(), name="ws_sender"),
                 asyncio.create_task(ws_outbound(websocket), name="ws_outbound"),
                 asyncio.create_task(_watch_stop(stop, websocket), name="watch_stop"),
             ]
+            if state.get("enable_mic", True):
+                tasks.append(asyncio.create_task(send_audio(), name="send_audio"))
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
             )
