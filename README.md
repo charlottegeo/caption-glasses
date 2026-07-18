@@ -107,8 +107,8 @@ These map to the **Live tuning** sliders in the pygame client.
 | `vad_sensitivity_boost` | Quiet speech | `0.0` | `0.0`–`0.12` | Lowers the voice-activity threshold so quieter speech is captured. Higher = more sensitive to soft voices (more false triggers in noise). |
 | `phrase_timeout_sec` | Pause ends line | `0.55` | `0.35`–`1.5` | Seconds of silence that end the current caption line and flush it as `final`. Higher = longer pauses allowed within one line. |
 | `max_utterance_sec` | Max line length | `6.0` | `3.0`–`14.0` | Maximum seconds of continuous speech before the server forces a line break (rolling flush). Higher = longer lines, more context for Whisper. |
-| `partial_min_interval_sec` | Partial delay | `0.12` | `0.05`–`0.60` | Minimum seconds between partial (in-progress) caption updates. Lower = snappier live text, more GPU load. Partials use a trailing ~2s window (no denoise) so Whisper stays fast. |
-| `partial_every_n_chunks` | Partial stride | `1` | `1`–`12` | Minimum new audio chunks between partial attempts (also gated by Partial delay). Lower = more frequent attempts. One chunk ≈ 0.13s. |
+| `partial_min_interval_sec` | Partial delay | `0.25` | `0.05`–`0.60` | Minimum seconds between partial (in-progress) caption updates. Lower = snappier live text, more GPU load. Partials use a trailing ~2s window (no denoise) and a stable-prefix lock so earlier words do not rewrite. |
+| `partial_every_n_chunks` | Partial stride | `3` | `1`–`12` | Minimum new audio chunks between partial attempts (also gated by Partial delay). Lower = more frequent attempts. One chunk ≈ 0.13s. |
 | `partial_beam` | Partial accuracy | `1` | `1`–`5` | Whisper beam width for **partial** captions. Higher = more accurate but slower live updates. |
 | `final_beam` | Word accuracy | `2` | `1`–`5` | Whisper beam width for **final** captions in transcribe mode. Higher = more accurate but slower. **Translate mode currently uses beam `1` regardless of this setting.** |
 | `transcribe_min_rms` | Volume floor | `0.004` | `0.001`–`0.008` | Minimum audio loudness (RMS) required before sending audio to Whisper. Higher = ignores quieter audio. |
@@ -197,8 +197,8 @@ Example — lyrics-style processing without switching the full lyrics preset:
 
 | `type` | Description |
 |--------|-------------|
-| `partial` | In-progress caption (`text`, `speaker`, optional `language`) |
-| `final` | Completed caption line (`text`, `speaker`, optional `language`) |
+| `partial` | In-progress caption (`text`, `speaker`, optional `language`). Server applies a stable-prefix lock so live text grows instead of rewriting earlier words. |
+| `final` | Completed caption line (`text`, `speaker`, optional `language`). May include `revise: true` to replace the previous final (used when a provisional line from the last partial is corrected by Whisper). |
 | `telemetry` | Noise/VAD stats (`env`, `noise_score`, `speech_prob`, `input_rms`, `capturing`, etc.) |
 | `sound` | Detected environmental sounds (`text`, `labels`) |
 | `settings` | Current session settings (response to `get_settings`, `set_mode`, or `set_settings`) |

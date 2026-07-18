@@ -21,6 +21,7 @@ from diart.inference import StreamingInference
 from config import (
     HF_TOKEN,
     SAMPLE_RATE,
+    SFX_DENOISE_MIN_NOISE_SCORE,
     YAMNET_BASE_THRESHOLD,
     YAMNET_DENOISE_STRENGTH,
     YAMNET_MAX_LABELS,
@@ -36,6 +37,7 @@ from core.session_settings import SessionSettings
 from core.yamnet_categories import (
     TRANSIENT_THRESHOLD_DELTA,
     VAGUE_SCORE_MARGIN,
+    YAMNET_SPEECH_LABELS,
     YAMNET_TRANSIENT_INDICES,
     YAMNET_VAGUE_LABELS,
     category_for_index,
@@ -85,7 +87,12 @@ diart_config: SpeakerDiarizationConfig = SpeakerDiarizationConfig(
 diarization: SpeakerDiarization = SpeakerDiarization(diart_config)
 
 audio_source: WebSocketAudioSource = WebSocketAudioSource(SAMPLE_RATE)
-pipeline: StreamingInference = StreamingInference(diarization, audio_source)
+pipeline: StreamingInference = StreamingInference(
+    diarization,
+    audio_source,
+    do_profile=False,
+    show_progress=False,
+)
 
 speaker_timeline: collections.deque[tuple[float, str]] = collections.deque(
     maxlen=200
@@ -180,11 +187,13 @@ def get_sounds(
     adaptive: YamnetAdaptiveState | None = None,
     exclude_categories: set[str] | None = None,
     settings: SessionSettings | None = None,
-) -> list[dict[str, str | float]]:
+    noise_score: float | None = None,
+) -> list[dict[str, str | float | bool]]:
     """
     Processes audio for sounds using category-based deduplication.
-    Returns dicts: label, category, score.
-    Filtering is by enabled categories only — no hard-coded label skip list.
+    Returns dicts: label, category, score, transient.
+    Filtering is by enabled categories only — no hard-coded label skip list,
+    except speech-only classes, which captions already cover.
     """
     thr = _resolve_yamnet_thresholds(profile, settings)
     base_threshold = thr["base_threshold"]
@@ -209,6 +218,8 @@ def get_sounds(
 
     if not np.isfinite(audio).all():
         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if noise_score is not None and noise_score < SFX_DENOISE_MIN_NOISE_SCORE:
+        denoise_strength = 0.0
     if denoise_strength > 0.05:
         clean_audio = nr.reduce_noise(
             y=audio,
@@ -232,6 +243,7 @@ def get_sounds(
     top_indices = tf.argsort(class_scores, direction="DESCENDING")[:top_k].numpy()
 
     candidates = []
+    considered_top: float | None = None
     for idx in top_indices:
         idx_i = int(idx)
         label = class_names[idx_i]
@@ -239,6 +251,11 @@ def get_sounds(
         assigned_cat = normalize_category(category_for_index(idx_i))
         if assigned_cat in skip_cats:
             continue
+        if label in YAMNET_SPEECH_LABELS:
+            continue
+
+        if considered_top is None or score > considered_top:
+            considered_top = score
 
         th = base_threshold
         if assigned_cat == "vehicle":
@@ -248,7 +265,8 @@ def get_sounds(
         elif assigned_cat == "music":
             th = music_threshold
 
-        if idx_i in YAMNET_TRANSIENT_INDICES:
+        is_transient = idx_i in YAMNET_TRANSIENT_INDICES
+        if is_transient:
             th = max(0.18, th - TRANSIENT_THRESHOLD_DELTA)
         elif label in YAMNET_VAGUE_LABELS:
             th = min(0.95, th + VAGUE_SCORE_MARGIN)
@@ -256,7 +274,17 @@ def get_sounds(
         if score < th:
             continue
 
-        candidates.append({"label": label, "score": score, "category": assigned_cat})
+        candidates.append(
+            {
+                "label": label,
+                "score": score,
+                "category": assigned_cat,
+                "transient": is_transient,
+            }
+        )
+
+    if adaptive is not None and considered_top is not None:
+        adaptive.after_window(considered_top)
 
     best_per_category: dict[str, dict] = {}
     for cand in candidates:
@@ -272,31 +300,29 @@ def get_sounds(
 
     kept = [c for c in best_per_category.values() if c["score"] >= floor]
     kept.sort(key=lambda x: x["score"], reverse=True)
-    out = [
+    return [
         {
             "label": c["label"],
             "category": c["category"],
             "score": round(float(c["score"]), 3),
+            "transient": bool(c["transient"]),
         }
         for c in kept[:max_labels]
     ]
-    if adaptive is not None and best_per_category:
-        adaptive.after_window(global_top)
-    return out
 
 def reset_speaker_timeline() -> None:
     speaker_timeline.clear()
 
 def reset_streaming_state() -> None:
     speaker_timeline.clear()
-    for target in (pipeline, diarization):
-        reset = getattr(target, "reset", None)
-        if callable(reset):
-            try:
-                reset()
-                return
-            except Exception:
-                pass
+    try:
+        pipeline.accumulator._prediction = None
+    except Exception:
+        pass
+    try:
+        diarization.reset()
+    except Exception:
+        pass
 
 def get_speaker_now(lookback_sec: float = 0.35) -> str:
     now = time.monotonic()
