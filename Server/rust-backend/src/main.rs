@@ -1,3 +1,4 @@
+mod models;
 mod sfx;
 
 use futures_util::StreamExt;
@@ -19,6 +20,8 @@ const PRE_ROLL_CHUNKS: usize = 10;
 const SAMPLE_RATE: u32 = 16_000;
 const SFX_WINDOW_SAMPLES: usize = SAMPLE_RATE as usize;
 const SFX_THRESHOLD: f32 = 0.4;
+const PARTIAL_WINDOW_SECONDS: usize = 8;
+const PARTIAL_WINDOW_SAMPLES: usize = SAMPLE_RATE as usize * PARTIAL_WINDOW_SECONDS;
 
 type Job = (Vec<f32>, tokio::sync::oneshot::Sender<String>);
 
@@ -28,6 +31,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|_| "models/ggml-tiny.en.bin".into());
     let final_model_path = std::env::var("WHISPER_FINAL_MODEL_PATH")
         .unwrap_or_else(|_| "models/ggml-base.en.bin".into());
+    models::ensure_model(&partial_model_path)?;
+    models::ensure_model(&final_model_path)?;
     const WHISPER_THREADS: i32 = 4;
     const FINAL_BEAM_SIZE: i32 = 2;
     let partial_job_tx = spawn_whisper_worker(partial_model_path, WHISPER_THREADS, None);
@@ -37,6 +42,7 @@ async fn main() -> Result<(), anyhow::Error> {
         std::env::var("YAMNET_MODEL_PATH").unwrap_or_else(|_| "models/yamnet.onnx".into());
     let yamnet_class_map_path = std::env::var("YAMNET_CLASS_MAP_PATH")
         .unwrap_or_else(|_| "models/yamnet_class_map.csv".into());
+    models::ensure_model(&yamnet_class_map_path)?;
     let yamnet = Arc::new(YamnetClassifier::load(&yamnet_model_path, &yamnet_class_map_path)?);
 
     let mic = MicInput::default();
@@ -49,6 +55,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut silence_chunks = 0usize;
     let mut chunks_since_partial = 0usize;
     let partial_inflight = Arc::new(AtomicBool::new(false));
+    let last_partial: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
     let mut sfx_buffer: Vec<f32> = Vec::with_capacity(SFX_WINDOW_SAMPLES);
     let sfx_inflight = Arc::new(AtomicBool::new(false));
@@ -58,8 +65,11 @@ async fn main() -> Result<(), anyhow::Error> {
         sample_rate = Source::sample_rate(&output.samples);
         let is_speech = output.probability > SPEECH_THRESHOLD;
         let chunk: Vec<f32> = output.samples.collect();
-
-        sfx_buffer.extend(resample_to_16k(chunk.clone(), sample_rate));
+        if sample_rate == SAMPLE_RATE {
+            sfx_buffer.extend_from_slice(&chunk);
+        } else {
+            sfx_buffer.extend(resample_to_16k(chunk.clone(), sample_rate));
+        }
         if sfx_buffer.len() >= SFX_WINDOW_SAMPLES && !sfx_inflight.swap(true, Ordering::Relaxed) {
             let window = std::mem::take(&mut sfx_buffer);
             spawn_sfx(
@@ -94,11 +104,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 && !partial_inflight.swap(true, Ordering::Relaxed)
             {
                 chunks_since_partial = 0;
+                let partial_audio = if buffer.len() > PARTIAL_WINDOW_SAMPLES {
+                    buffer[buffer.len() - PARTIAL_WINDOW_SAMPLES..].to_vec()
+                } else {
+                    buffer.clone()
+                };
                 spawn_partial(
                     partial_job_tx.clone(),
-                    buffer.clone(),
+                    partial_audio,
                     sample_rate,
                     partial_inflight.clone(),
+                    last_partial.clone(),
                 );
             }
         } else if speaking {
@@ -108,6 +124,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 speaking = false;
                 silence_chunks = 0;
                 chunks_since_partial = 0;
+                last_partial.lock().unwrap().clear();
                 spawn_final(final_job_tx.clone(), audio, sample_rate);
             }
         }
@@ -167,12 +184,17 @@ fn spawn_partial(
     audio: Vec<f32>,
     sample_rate: u32,
     inflight: Arc<AtomicBool>,
+    last_partial: Arc<Mutex<String>>,
 ) {
     tokio::spawn(async move {
         let text = run_job(&job_tx, audio, sample_rate).await;
         if !text.is_empty() {
-            print!("\r\x1b[2K{text}");
-            let _ = std::io::stdout().flush();
+            let mut last = last_partial.lock().unwrap();
+            if *last != text {
+                print!("\r\x1b[2K[partial] {text}");
+                let _ = std::io::stdout().flush();
+                *last = text;
+            }
         }
         inflight.store(false, Ordering::Relaxed);
     });
