@@ -6,6 +6,7 @@ use std::sync::Mutex;
 const BASELINE_EMA_ALPHA: f32 = 0.15;
 const SPIKE_MARGIN: f32 = 0.18;
 
+//Groups the 521 YAMNet classes into 10 categories
 const CATEGORY_RANGES: &[(&str, std::ops::Range<usize>)] = &[
     ("human", 0..67),
     ("animal", 67..132),
@@ -19,11 +20,13 @@ const CATEGORY_RANGES: &[(&str, std::ops::Range<usize>)] = &[
     ("ambient", 499..521),
 ];
 
+//Classifies audio, and outputs the most likely class and category, along with a confidence score
 pub struct YamnetClassifier {
     session: Session,
     labels: Vec<String>,
     category_baseline: Mutex<HashMap<&'static str, f32>>,
 }
+
 
 pub struct Detection {
     pub label: String,
@@ -93,6 +96,7 @@ impl YamnetClassifier {
     }
 }
 
+//Returns the category name for a given class index
 fn category_for_index(idx: usize) -> &'static str {
     CATEGORY_RANGES
         .iter()
@@ -101,6 +105,7 @@ fn category_for_index(idx: usize) -> &'static str {
         .unwrap_or("other")
 }
 
+//Loads the class names from the YAMNet class map CSV file
 fn load_class_names(path: &str) -> anyhow::Result<Vec<String>> {
     let content = std::fs::read_to_string(path)?;
     Ok(content
@@ -110,6 +115,8 @@ fn load_class_names(path: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+
+//Parses a CSV line from the YAMNet class map, and returns the display name (3rd column) if present
 fn parse_csv_display_name(line: &str) -> Option<String> {
     let mut fields = Vec::new();
     let mut field = String::new();

@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+//Holds model files and their download URLs, so it downloads them if missing
 const KNOWN_MODELS: &[(&str, &str)] = &[
     (
         "models/ggml-tiny.en.bin",
@@ -17,7 +18,9 @@ const KNOWN_MODELS: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn ensure_model(path: &str) -> anyhow::Result<()> {
+
+//Checks if the model file exists, and downloads it if not. Returns an error if the model is missing and there is no download URL for it.
+pub fn check_for_model(path: &str) -> anyhow::Result<()> {
     if Path::new(path).exists() {
         return Ok(());
     }
@@ -28,14 +31,14 @@ pub fn ensure_model(path: &str) -> anyhow::Result<()> {
         .map(|(_, url)| *url)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "model file '{path}' is missing and no download source is known for it \
-                 (auto-download only covers the default model paths)"
+                "Model file '{path}' is missing and no download source is present"
             )
         })?;
 
     download(url, path)
 }
 
+//Downloads a file from the given URL to the given destination path, showing progress in the console
 fn download(url: &str, dest: &str) -> anyhow::Result<()> {
     eprintln!("[models] {dest} not found, downloading from {url}");
     if let Some(parent) = Path::new(dest).parent() {
@@ -73,6 +76,7 @@ fn download(url: &str, dest: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+//Reports download progress to the console, either as a percentage if total size is known, or in MB if not
 fn report_progress(dest: &str, downloaded: u64, total: Option<u64>) {
     match total {
         Some(total) if total > 0 => {
