@@ -1,252 +1,90 @@
+mod audio;
 mod models;
+mod moonshine;
+mod music;
+mod partial;
+mod pipeline;
 mod sfx;
 
-use futures_util::StreamExt;
-use kalosm_sound::*;
-use rodio::{buffer::SamplesBuffer, source::UniformSourceIterator, Source};
+use audio::VadChunk;
+use pipeline::{SfxWindower, SpeechSegmenter, SPEECH_THRESHOLD};
 use sfx::YamnetClassifier;
-use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc as std_mpsc, Arc, Mutex,
-};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use std::sync::Arc;
 
-const SPEECH_THRESHOLD: f32 = 0.5;
-const PARTIAL_EVERY_CHUNKS: usize = 16;
-const END_SILENCE_CHUNKS: usize = 20;
-const PRE_ROLL_CHUNKS: usize = 10;
 const SAMPLE_RATE: u32 = 16_000;
-const SFX_WINDOW_SAMPLES: usize = SAMPLE_RATE as usize;
-const SFX_THRESHOLD: f32 = 0.4;
-const PARTIAL_WINDOW_SECONDS: usize = 8;
-const PARTIAL_WINDOW_SAMPLES: usize = SAMPLE_RATE as usize * PARTIAL_WINDOW_SECONDS;
 
-type Job = (Vec<f32>, tokio::sync::oneshot::Sender<String>);
+// Cooper tasks:
+// - Implement websockets. the server should receive a microphone stream and any settings from the client, and send back the transcribed text as well as any SFX. also it should accept settings like translation mode and profanity filter.
+// - oh yeah the payload is JSON
+// - implement profanity filter. look into rustrict or badwords-core, and feel free to experiment to see which is better, or if another package works best. it should run on the transcribed text before it is sent back to the client. also it should accept a list of blocked words and words that should not be blocked from .env
+// - maybe make it so if a websocket url is not provided, it will make a websocket server so websockets can be tested locally
+// note: for all the above tasks, feel free to look at the python src/ folder for how it was set up in Python. it is a mess, the goal with this rewrite is to make the backend more organized and efficient
+// if theres anything else you would like to implement/mess with, feel free to do so. just no diarization yet
+// python backend is a mess i am so sorry, please feel free to ask for help or clarification with anything. You got this!!!
+//
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let partial_model_path = std::env::var("WHISPER_PARTIAL_MODEL_PATH")
-        .unwrap_or_else(|_| "models/ggml-tiny.en.bin".into());
-    let final_model_path = std::env::var("WHISPER_FINAL_MODEL_PATH")
-        .unwrap_or_else(|_| "models/ggml-base.en.bin".into());
-    models::ensure_model(&partial_model_path)?;
-    models::ensure_model(&final_model_path)?;
-    const WHISPER_THREADS: i32 = 4;
-    const FINAL_BEAM_SIZE: i32 = 2;
-    let partial_job_tx = spawn_whisper_worker(partial_model_path, WHISPER_THREADS, None);
-    let final_job_tx = spawn_whisper_worker(final_model_path, WHISPER_THREADS, Some(FINAL_BEAM_SIZE));
+    let (partial_tx, final_job_tx, yamnet) = load_models().await?;
 
-    let yamnet_model_path =
-        std::env::var("YAMNET_MODEL_PATH").unwrap_or_else(|_| "models/yamnet.onnx".into());
-    let yamnet_class_map_path = std::env::var("YAMNET_CLASS_MAP_PATH")
-        .unwrap_or_else(|_| "models/yamnet_class_map.csv".into());
-    models::ensure_model(&yamnet_class_map_path)?;
-    let yamnet = Arc::new(YamnetClassifier::load(&yamnet_model_path, &yamnet_class_map_path)?);
+    let mut vad_stream = audio::spawn_mic_vad_stream()?;
+    let mut segmenter = SpeechSegmenter::new();
+    let mut sfx_windower = SfxWindower::new();
 
-    let mic = MicInput::default();
-    let mut vad_stream = mic.stream().voice_activity_stream();
+    while let Some(VadChunk {
+        samples: chunk,
+        probability,
+    }) = vad_stream.recv().await
+    {
+        let is_speech = probability > SPEECH_THRESHOLD;
+        sfx_windower.ingest(&yamnet, &chunk);
 
-    let mut buffer: Vec<f32> = Vec::new();
-    let mut pre_roll: VecDeque<Vec<f32>> = VecDeque::with_capacity(PRE_ROLL_CHUNKS);
-    let mut sample_rate = SAMPLE_RATE;
-    let mut speaking = false;
-    let mut silence_chunks = 0usize;
-    let mut chunks_since_partial = 0usize;
-    let partial_inflight = Arc::new(AtomicBool::new(false));
-    let last_partial: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
-    let mut sfx_buffer: Vec<f32> = Vec::with_capacity(SFX_WINDOW_SAMPLES);
-    let sfx_inflight = Arc::new(AtomicBool::new(false));
-    let last_sfx_label: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
-    while let Some(output) = vad_stream.next().await {
-        sample_rate = Source::sample_rate(&output.samples);
-        let is_speech = output.probability > SPEECH_THRESHOLD;
-        let chunk: Vec<f32> = output.samples.collect();
-        if sample_rate == SAMPLE_RATE {
-            sfx_buffer.extend_from_slice(&chunk);
-        } else {
-            sfx_buffer.extend(resample_to_16k(chunk.clone(), sample_rate));
-        }
-        if sfx_buffer.len() >= SFX_WINDOW_SAMPLES && !sfx_inflight.swap(true, Ordering::Relaxed) {
-            let window = std::mem::take(&mut sfx_buffer);
-            spawn_sfx(
-                yamnet.clone(),
-                window,
-                sfx_inflight.clone(),
-                last_sfx_label.clone(),
-            );
-        }
-
-        if is_speech && !speaking {
-            for pre in pre_roll.drain(..) {
-                buffer.extend(pre);
-            }
-        }
-
-        if is_speech || speaking {
-            buffer.extend(chunk);
-        } else {
-            if pre_roll.len() == PRE_ROLL_CHUNKS {
-                pre_roll.pop_front();
-            }
-            pre_roll.push_back(chunk);
-        }
-
-        if is_speech {
-            speaking = true;
-            silence_chunks = 0;
-            chunks_since_partial += 1;
-
-            if chunks_since_partial >= PARTIAL_EVERY_CHUNKS
-                && !partial_inflight.swap(true, Ordering::Relaxed)
-            {
-                chunks_since_partial = 0;
-                let partial_audio = if buffer.len() > PARTIAL_WINDOW_SAMPLES {
-                    buffer[buffer.len() - PARTIAL_WINDOW_SAMPLES..].to_vec()
-                } else {
-                    buffer.clone()
-                };
-                spawn_partial(
-                    partial_job_tx.clone(),
-                    partial_audio,
-                    sample_rate,
-                    partial_inflight.clone(),
-                    last_partial.clone(),
-                );
-            }
-        } else if speaking {
-            silence_chunks += 1;
-            if silence_chunks >= END_SILENCE_CHUNKS {
-                let audio = std::mem::take(&mut buffer);
-                speaking = false;
-                silence_chunks = 0;
-                chunks_since_partial = 0;
-                last_partial.lock().unwrap().clear();
-                spawn_final(final_job_tx.clone(), audio, sample_rate);
-            }
+        if let Some(utterance) = segmenter.ingest(&partial_tx, chunk, is_speech) {
+            moonshine::spawn_final(final_job_tx.clone(), utterance);
         }
     }
 
     Ok(())
 }
 
-fn spawn_whisper_worker(
-    model_path: String,
-    n_threads: i32,
-    beam_size: Option<i32>,
-) -> std_mpsc::Sender<Job> {
-    let (tx, rx) = std_mpsc::channel::<Job>();
-    std::thread::spawn(move || {
-        let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-            .expect("failed to load whisper model");
-        let mut state = ctx.create_state().expect("failed to create whisper state");
+async fn load_models() -> anyhow::Result<(
+    std::sync::mpsc::Sender<partial::PartialMsg>,
+    std::sync::mpsc::Sender<moonshine::Job>,
+    Arc<YamnetClassifier>,
+)> {
+    let vosk_model_path = std::env::var("VOSK_MODEL_PATH")
+        .unwrap_or_else(|_| "models/vosk-model-small-en-us-0.15".into());
+    let moonshine_model_dir = std::env::var("MOONSHINE_MODEL_DIR")
+        .unwrap_or_else(|_| "models/sherpa-onnx-moonshine-base-en-int8".into());
+    models::check_for_model_archive(&vosk_model_path)?;
+    models::check_for_model_archive(&moonshine_model_dir)?;
 
-        for (audio, reply) in rx {
-            let strategy = match beam_size {
-                Some(beam_size) => SamplingStrategy::BeamSearch {
-                    beam_size,
-                    patience: -1.0,
-                },
-                None => SamplingStrategy::Greedy { best_of: 1 },
-            };
-            let mut params = FullParams::new(strategy);
-            params.set_language(Some("en"));
-            params.set_n_threads(n_threads);
-            params.set_single_segment(true);
-            params.set_no_context(true);
-            params.set_print_special(false);
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
+    let moonshine_threads: i32 = env_parsed("MOONSHINE_THREADS").unwrap_or(2);
+    let itn_enabled: bool = env_parsed("ITN_ENABLED").unwrap_or(true);
+    let partial_tx = partial::spawn_vosk_worker(vosk_model_path);
+    let final_job_tx = moonshine::spawn_moonshine_worker(
+        moonshine::MoonshinePaths {
+            preprocessor: format!("{moonshine_model_dir}/preprocess.onnx"),
+            encoder: format!("{moonshine_model_dir}/encode.int8.onnx"),
+            uncached_decoder: format!("{moonshine_model_dir}/uncached_decode.int8.onnx"),
+            cached_decoder: format!("{moonshine_model_dir}/cached_decode.int8.onnx"),
+            tokens: format!("{moonshine_model_dir}/tokens.txt"),
+        },
+        moonshine_threads,
+        itn_enabled,
+    );
 
-            params.set_suppress_nst(true);
+    let yamnet_model_path =
+        std::env::var("YAMNET_MODEL_PATH").unwrap_or_else(|_| "models/yamnet.onnx".into());
+    let yamnet_class_map_path = std::env::var("YAMNET_CLASS_MAP_PATH")
+        .unwrap_or_else(|_| "models/yamnet_class_map.csv".into());
+    models::check_for_model(&yamnet_model_path)?;
+    models::check_for_model(&yamnet_class_map_path)?;
+    let yamnet = Arc::new(YamnetClassifier::load(&yamnet_model_path, &yamnet_class_map_path)?);
 
-            let text = match state.full(params, &audio) {
-                Ok(_) => state
-                    .as_iter()
-                    .map(|segment| segment.to_string())
-                    .collect::<String>()
-                    .trim()
-                    .to_string(),
-                Err(_) => String::new(),
-            };
-            let _ = reply.send(text);
-        }
-    });
-    tx
+    Ok((partial_tx, final_job_tx, yamnet))
 }
 
-fn spawn_partial(
-    job_tx: std_mpsc::Sender<Job>,
-    audio: Vec<f32>,
-    sample_rate: u32,
-    inflight: Arc<AtomicBool>,
-    last_partial: Arc<Mutex<String>>,
-) {
-    tokio::spawn(async move {
-        let text = run_job(&job_tx, audio, sample_rate).await;
-        if !text.is_empty() {
-            let mut last = last_partial.lock().unwrap();
-            if *last != text {
-                print!("\r\x1b[2K[partial] {text}");
-                let _ = std::io::stdout().flush();
-                *last = text;
-            }
-        }
-        inflight.store(false, Ordering::Relaxed);
-    });
-}
-
-fn spawn_final(job_tx: std_mpsc::Sender<Job>, audio: Vec<f32>, sample_rate: u32) {
-    tokio::spawn(async move {
-        let text = run_job(&job_tx, audio, sample_rate).await;
-        if !text.is_empty() {
-            println!("\r\x1b[2K{text}");
-        }
-    });
-}
-
-async fn run_job(job_tx: &std_mpsc::Sender<Job>, audio: Vec<f32>, sample_rate: u32) -> String {
-    let pcm = resample_to_16k(audio, sample_rate);
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if job_tx.send((pcm, reply_tx)).is_err() {
-        return String::new();
-    }
-    reply_rx.await.unwrap_or_default()
-}
-
-fn spawn_sfx(
-    yamnet: Arc<YamnetClassifier>,
-    window: Vec<f32>,
-    inflight: Arc<AtomicBool>,
-    last_label: Arc<Mutex<String>>,
-) {
-    tokio::spawn(async move {
-        let detection = tokio::task::spawn_blocking(move || yamnet.classify(&window, SFX_THRESHOLD))
-            .await
-            .unwrap_or(None);
-        inflight.store(false, Ordering::Relaxed);
-
-        if let Some(detection) = detection {
-            let mut last = last_label.lock().unwrap();
-            if *last != detection.label {
-                println!(
-                    "\n[sfx] {} ({}, {:.2})",
-                    detection.label, detection.category, detection.score
-                );
-                *last = detection.label;
-            }
-        }
-    });
-}
-
-fn resample_to_16k(audio: Vec<f32>, sample_rate: u32) -> Vec<f32> {
-    if sample_rate == SAMPLE_RATE {
-        return audio;
-    }
-    let source = SamplesBuffer::new(1, sample_rate, audio);
-    UniformSourceIterator::<_, f32>::new(source, 1, SAMPLE_RATE).collect()
+fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
 }

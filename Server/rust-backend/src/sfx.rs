@@ -6,7 +6,6 @@ use std::sync::Mutex;
 const BASELINE_EMA_ALPHA: f32 = 0.15;
 const SPIKE_MARGIN: f32 = 0.18;
 
-//Groups the 521 YAMNet classes into 10 categories
 const CATEGORY_RANGES: &[(&str, std::ops::Range<usize>)] = &[
     ("human", 0..67),
     ("animal", 67..132),
@@ -20,13 +19,11 @@ const CATEGORY_RANGES: &[(&str, std::ops::Range<usize>)] = &[
     ("ambient", 499..521),
 ];
 
-//Classifies audio, and outputs the most likely class and category, along with a confidence score
 pub struct YamnetClassifier {
     session: Session,
     labels: Vec<String>,
     category_baseline: Mutex<HashMap<&'static str, f32>>,
 }
-
 
 pub struct Detection {
     pub label: String,
@@ -45,7 +42,36 @@ impl YamnetClassifier {
         })
     }
 
-    pub fn classify(&self, pcm: &[f32], threshold: f32) -> Option<Detection> {
+    pub fn analyze(&self, pcm: &[f32], sfx_threshold: f32, music_threshold: f32) -> (Option<Detection>, bool) {
+        let Some((best_idx, best_score)) = self.best_category(pcm) else {
+            return (None, false);
+        };
+        let category = category_for_index(best_idx);
+        let is_music = best_score >= music_threshold && category == "music";
+
+        if best_score < sfx_threshold {
+            return (None, is_music);
+        }
+
+        let mut baselines = self.category_baseline.lock().unwrap();
+        let baseline = baselines.entry(category).or_insert(0.0);
+        let prior_baseline = *baseline;
+        *baseline = BASELINE_EMA_ALPHA * best_score + (1.0 - BASELINE_EMA_ALPHA) * prior_baseline;
+        drop(baselines);
+
+        if best_score < prior_baseline + SPIKE_MARGIN {
+            return (None, is_music);
+        }
+
+        let detection = Detection {
+            label: self.labels.get(best_idx).cloned().unwrap_or_default(),
+            category,
+            score: best_score,
+        };
+        (Some(detection), is_music)
+    }
+
+    fn best_category(&self, pcm: &[f32]) -> Option<(usize, f32)> {
         let input = Array1::from_vec(pcm.to_vec());
         let outputs = self
             .session
@@ -73,30 +99,10 @@ impl YamnetClassifier {
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?;
-        if best_score < threshold {
-            return None;
-        }
-        let category = category_for_index(best_idx);
-
-        let mut baselines = self.category_baseline.lock().unwrap();
-        let baseline = baselines.entry(category).or_insert(0.0);
-        let prior_baseline = *baseline;
-        *baseline = BASELINE_EMA_ALPHA * best_score + (1.0 - BASELINE_EMA_ALPHA) * prior_baseline;
-        drop(baselines);
-
-        if best_score < prior_baseline + SPIKE_MARGIN {
-            return None;
-        }
-
-        Some(Detection {
-            label: self.labels.get(best_idx).cloned().unwrap_or_default(),
-            category,
-            score: best_score,
-        })
+        Some((best_idx, best_score))
     }
 }
 
-//Returns the category name for a given class index
 fn category_for_index(idx: usize) -> &'static str {
     CATEGORY_RANGES
         .iter()
@@ -105,7 +111,6 @@ fn category_for_index(idx: usize) -> &'static str {
         .unwrap_or("other")
 }
 
-//Loads the class names from the YAMNet class map CSV file
 fn load_class_names(path: &str) -> anyhow::Result<Vec<String>> {
     let content = std::fs::read_to_string(path)?;
     Ok(content
@@ -115,8 +120,6 @@ fn load_class_names(path: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-
-//Parses a CSV line from the YAMNet class map, and returns the display name (3rd column) if present
 fn parse_csv_display_name(line: &str) -> Option<String> {
     let mut fields = Vec::new();
     let mut field = String::new();

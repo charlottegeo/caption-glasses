@@ -1,5 +1,7 @@
-/models/*.bin
 /models/*.onnx
+/models/vosk-*/
+/models/sherpa-onnx-moonshine-*/
+/native/
 debug
 target
 **/*.rs.bk
