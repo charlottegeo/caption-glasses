@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+//This file holds the transcription and yamnet model urls and downloads them if they aren't present, there might be a better way to do this
+
 const KNOWN_MODELS: &[(&str, &str)] = &[
     (
         "models/yamnet_class_map.csv",

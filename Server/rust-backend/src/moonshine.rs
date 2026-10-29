@@ -7,8 +7,10 @@ use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 const BACKLOG_WARN_THRESHOLD: Duration = Duration::from_millis(1500);
 const BACKLOG_WARN_COOLDOWN: Duration = Duration::from_secs(10);
 
+//A queued transcription job carrying the waveform samples, the timestamp it was submitted, and a channel to return the transcribed text
 pub type Job = (Vec<f32>, Instant, oneshot::Sender<String>);
 
+//Holds the paths for the Moonshine model files
 pub struct MoonshinePaths {
     pub preprocessor: String,
     pub encoder: String,
@@ -17,6 +19,7 @@ pub struct MoonshinePaths {
     pub tokens: String,
 }
 
+/// Starts a background worker thread that processes transcription jobs
 pub fn spawn_moonshine_worker(
     paths: MoonshinePaths,
     n_threads: i32,
@@ -66,6 +69,7 @@ pub fn spawn_moonshine_worker(
     tx
 }
 
+//Queues a final transcription request on the worker and prints the result if it contains any text
 pub fn spawn_final(job_tx: std_mpsc::Sender<Job>, audio: Vec<f32>) {
     tokio::spawn(async move {
         let text = run_job(&job_tx, audio).await;
@@ -75,6 +79,7 @@ pub fn spawn_final(job_tx: std_mpsc::Sender<Job>, audio: Vec<f32>) {
     });
 }
 
+//Sends an audio chunk to the Moonshine worker and waits for the text returned by the recognizer
 async fn run_job(job_tx: &std_mpsc::Sender<Job>, audio: Vec<f32>) -> String {
     let (reply_tx, reply_rx) = oneshot::channel();
     if job_tx.send((audio, Instant::now(), reply_tx)).is_err() {
@@ -83,6 +88,7 @@ async fn run_job(job_tx: &std_mpsc::Sender<Job>, audio: Vec<f32>) -> String {
     reply_rx.await.unwrap_or_default()
 }
 
+//Prints the transcript text to the console, replacing the current line.
 fn emit_transcript(text: &str) {
     println!("\r\x1b[2K{text}");
 }

@@ -13,16 +13,6 @@ use std::sync::Arc;
 
 const SAMPLE_RATE: u32 = 16_000;
 
-// Cooper tasks:
-// - Implement websockets. the server should receive a microphone stream and any settings from the client, and send back the transcribed text as well as any SFX. also it should accept settings like translation mode and profanity filter.
-// - oh yeah the payload is JSON
-// - implement profanity filter. look into rustrict or badwords-core, and feel free to experiment to see which is better, or if another package works best. it should run on the transcribed text before it is sent back to the client. also it should accept a list of blocked words and words that should not be blocked from .env
-// - maybe make it so if a websocket url is not provided, it will make a websocket server so websockets can be tested locally
-// note: for all the above tasks, feel free to look at the python src/ folder for how it was set up in Python. it is a mess, the goal with this rewrite is to make the backend more organized and efficient
-// if theres anything else you would like to implement/mess with, feel free to do so. just no diarization yet
-// python backend is a mess i am so sorry, please feel free to ask for help or clarification with anything. You got this!!!
-//
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let (partial_tx, final_job_tx, yamnet) = load_models().await?;
@@ -31,6 +21,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut segmenter = SpeechSegmenter::new();
     let mut sfx_windower = SfxWindower::new();
 
+    //listens for audio and if it passes the VAD threshold it checks for SFX and transcribes it
     while let Some(VadChunk {
         samples: chunk,
         probability,
@@ -47,6 +38,7 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+//this just loads the models and spawns the workers for partial and final transcription, plus the yamnet classifier (sfx)
 async fn load_models() -> anyhow::Result<(
     std::sync::mpsc::Sender<partial::PartialMsg>,
     std::sync::mpsc::Sender<moonshine::Job>,

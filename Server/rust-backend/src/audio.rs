@@ -13,6 +13,7 @@ pub struct VadChunk {
     pub probability: f32,
 }
 
+//Spawns a thread that reads from the microphone and sends chunks of audio to a channel, along with the probability of speech detected in that chunk.
 pub fn spawn_mic_vad_stream() -> anyhow::Result<tokio_mpsc::UnboundedReceiver<VadChunk>> {
     let host = cpal::default_host();
     let device = host
@@ -97,6 +98,7 @@ pub fn spawn_mic_vad_stream() -> anyhow::Result<tokio_mpsc::UnboundedReceiver<Va
     Ok(vad_rx)
 }
 
+//Downmixes multi-channel audio to mono by averaging the channels, the VAD model expects mono audio
 fn downmix(data: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return data.to_vec();
@@ -106,6 +108,7 @@ fn downmix(data: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
+//Resamples audio to 16kHz
 fn resample_to_16k(audio: Vec<f32>, sample_rate: u32) -> Vec<f32> {
     if sample_rate == SAMPLE_RATE {
         return audio;
